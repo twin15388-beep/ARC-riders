@@ -1,0 +1,6 @@
+/build/
+/out/
+/dropbox/
+*.user
+*.suo
+.vs/

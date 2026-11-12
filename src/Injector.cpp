@@ -1,0 +1,154 @@
+#ifdef _WIN32
+
+#include <windows.h>
+
+#include <cstdint>
+#include <filesystem>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace {
+
+[[noreturn]] void ThrowWin32(const std::string& operation, const DWORD error = ::GetLastError()) {
+    throw std::runtime_error(operation + ": Win32 error " + std::to_string(error));
+}
+
+class Handle {
+public:
+    explicit Handle(HANDLE value = nullptr) : value_(value) {}
+    ~Handle() {
+        if (value_ != nullptr && value_ != INVALID_HANDLE_VALUE) {
+            ::CloseHandle(value_);
+        }
+    }
+    Handle(const Handle&) = delete;
+    Handle& operator=(const Handle&) = delete;
+    [[nodiscard]] HANDLE Get() const noexcept { return value_; }
+private:
+    HANDLE value_{};
+};
+
+class RemoteMemory {
+public:
+    RemoteMemory(HANDLE process, void* address) : process_(process), address_(address) {}
+    ~RemoteMemory() {
+        if (address_ != nullptr) {
+            ::VirtualFreeEx(process_, address_, 0, MEM_RELEASE);
+        }
+    }
+    RemoteMemory(const RemoteMemory&) = delete;
+    RemoteMemory& operator=(const RemoteMemory&) = delete;
+    [[nodiscard]] void* Get() const noexcept { return address_; }
+    void Release() noexcept { address_ = nullptr; }
+private:
+    HANDLE process_{};
+    void* address_{};
+};
+
+std::uint32_t ParsePid(const char* text) {
+    std::size_t consumed = 0;
+    const std::string value(text);
+    const auto pid = std::stoull(value, &consumed, 10);
+    if (consumed != value.size() || pid == 0 || pid > UINT32_MAX) {
+        throw std::invalid_argument("PID must be a decimal integer in range 1..4294967295");
+    }
+    return static_cast<std::uint32_t>(pid);
+}
+
+void Inject(const std::uint32_t pid, const std::filesystem::path& dll_path) {
+    const auto full_path = std::filesystem::canonical(dll_path);
+    if (!std::filesystem::is_regular_file(full_path) || std::filesystem::file_size(full_path) == 0) {
+        throw std::runtime_error("DLL path is not a nonempty regular file");
+    }
+    const auto native = full_path.wstring();
+    const auto bytes = (native.size() + 1) * sizeof(wchar_t);
+    if (bytes > 32768 * sizeof(wchar_t)) {
+        throw std::runtime_error("DLL path is too long");
+    }
+
+    Handle process(::OpenProcess(
+        PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION |
+        PROCESS_VM_WRITE | PROCESS_VM_READ, FALSE, pid));
+    if (process.Get() == nullptr) {
+        ThrowWin32("OpenProcess injector failed for PID " + std::to_string(pid));
+    }
+    BOOL wow64 = FALSE;
+    if (!::IsWow64Process(process.Get(), &wow64)) {
+        ThrowWin32("IsWow64Process failed");
+    }
+    if (wow64) {
+        throw std::runtime_error("32-bit targets are not supported");
+    }
+
+    RemoteMemory remote_memory(process.Get(), ::VirtualAllocEx(
+        process.Get(), nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (remote_memory.Get() == nullptr) {
+        ThrowWin32("VirtualAllocEx failed");
+    }
+    SIZE_T written = 0;
+    if (!::WriteProcessMemory(process.Get(), remote_memory.Get(), native.c_str(), bytes, &written) || written != bytes) {
+        ThrowWin32("WriteProcessMemory DLL path failed");
+    }
+
+    const auto kernel = ::GetModuleHandleW(L"kernel32.dll");
+    if (kernel == nullptr) {
+        ThrowWin32("GetModuleHandleW kernel32 failed");
+    }
+    const auto load_library = ::GetProcAddress(kernel, "LoadLibraryW");
+    if (load_library == nullptr) {
+        ThrowWin32("GetProcAddress LoadLibraryW failed");
+    }
+
+    Handle thread(::CreateRemoteThread(
+        process.Get(), nullptr, 0,
+        reinterpret_cast<LPTHREAD_START_ROUTINE>(load_library),
+        remote_memory.Get(), 0, nullptr));
+    if (thread.Get() == nullptr) {
+        ThrowWin32("CreateRemoteThread LoadLibraryW failed");
+    }
+    if (::WaitForSingleObject(thread.Get(), 60000) != WAIT_OBJECT_0) {
+        remote_memory.Release(); // LoadLibraryW may still be reading the path.
+        ThrowWin32("WaitForSingleObject LoadLibraryW failed or timed out");
+    }
+    DWORD module_handle = 0;
+    if (!::GetExitCodeThread(thread.Get(), &module_handle)) {
+        ThrowWin32("GetExitCodeThread LoadLibraryW failed");
+    }
+    if (!::VirtualFreeEx(process.Get(), remote_memory.Get(), 0, MEM_RELEASE)) {
+        ThrowWin32("VirtualFreeEx DLL path failed");
+    }
+    remote_memory.Release();
+    if (module_handle == 0) {
+        throw std::runtime_error("LoadLibraryW returned null in the target process");
+    }
+    std::cout << "LoadLibraryW succeeded; remote module handle=0x" << std::hex << module_handle << '\n';
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+    try {
+        if (argc != 3) {
+            std::cout << "arc_inject <pid> <Dumper-7.dll>\n";
+            return 2;
+        }
+        Inject(ParsePid(argv[1]), argv[2]);
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << "error: " << error.what() << '\n';
+        return 1;
+    }
+}
+
+#else
+
+#include <iostream>
+
+int main() {
+    std::cerr << "arc_inject must be built for Windows\n";
+    return 1;
+}
+
+#endif
