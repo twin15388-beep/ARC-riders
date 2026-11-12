@@ -204,6 +204,12 @@ int main(int argc, char** argv) {
             arc::PrintDumpRead(argv[2], arc::ParseUnsigned(argv[3]), static_cast<std::size_t>(size));
             return 0;
         }
+        if (argc >= 5 && std::string_view(argv[1]) == "dump-rtti") {
+            std::vector<std::uint64_t> vtables;
+            for (int i = 4; i < argc; ++i) vtables.push_back(arc::ParseUnsigned(argv[i]));
+            arc::PrintDumpRtti(argv[2], arc::ParseUnsigned(argv[3]), vtables);
+            return 0;
+        }
         if (argc >= 4 && std::string_view(argv[1]) == "dump-chain") {
             std::vector<std::uint64_t> offsets;
             for (int i = 4; i < argc; ++i) {

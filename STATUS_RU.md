@@ -341,3 +341,7 @@ decrypt-viewport <LocalPlayer> <ModuleBase> <0x100HexBytes>
 5. После появления class/name resolution генерировать минимальный SDK и лишь затем проектировать overlay/ESP.
 
 Это медленнее, чем копировать offsets, но исключает построение проекта на правдоподобных, однако неверных указателях.
+
+## 14. Продолжение: RTTI resolver
+
+Добавлена команда `dump-rtti <DMP> <ImageBase> <VtableVA>...`. Она читает MSVC x64 `CompleteObjectLocator` через `vtable-8`, затем `TypeDescriptor` по RVA от image base и выводит decorated C++ class name. Это независимый от GNames/FNamePool способ проверить найденные vtables. На момент добавления результаты на игровом дампе ещё не получены.

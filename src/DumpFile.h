@@ -16,6 +16,10 @@ void PrintDumpStrings(const std::filesystem::path& path, std::string_view needle
 void PrintDumpXrefs(const std::filesystem::path& path, std::uint64_t target_va);
 void PrintDumpScan(const std::filesystem::path& path, const Pattern& pattern);
 void PrintDumpRead(const std::filesystem::path& path, std::uint64_t va, std::size_t size);
+void PrintDumpRtti(
+    const std::filesystem::path& path,
+    std::uint64_t image_base,
+    const std::vector<std::uint64_t>& vtables);
 void PrintDumpPointerChain(
     const std::filesystem::path& path,
     std::uint64_t pointer_va,

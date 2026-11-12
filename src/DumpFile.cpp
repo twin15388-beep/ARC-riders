@@ -388,6 +388,45 @@ void PrintDumpRead(const std::filesystem::path& path, const std::uint64_t va, co
     throw std::runtime_error("requested VA range is not captured in the dump");
 }
 
+void PrintDumpRtti(
+    const std::filesystem::path& path,
+    const std::uint64_t image_base,
+    const std::vector<std::uint64_t>& vtables) {
+    if (image_base == 0 || vtables.empty() || vtables.size() > 32) {
+        throw std::invalid_argument("dump RTTI requires an image base and 1..32 vtables");
+    }
+    const MappedFile file(path);
+    const auto bytes = file.Bytes();
+    const auto ranges = ReadMemoryRanges(bytes, ReadStreams(bytes));
+    for (const auto vtable : vtables) {
+        std::cout << "vtable=0x" << std::hex << vtable << std::dec << '\n';
+        if (vtable < 8) throw std::invalid_argument("vtable address underflow");
+        const auto locator_pointer = ReadVa(bytes, ranges, vtable - 8, 8);
+        if (!locator_pointer) throw std::runtime_error("RTTI locator pointer is not captured");
+        const auto locator_va = U64(locator_pointer->data());
+        const auto locator = ReadVa(bytes, ranges, locator_va, 20);
+        if (!locator) throw std::runtime_error("RTTI CompleteObjectLocator is not captured");
+        const auto signature = U32(locator->data());
+        const auto type_rva = U32(locator->data() + 12);
+        if (signature != 1 || type_rva == 0 || image_base > std::numeric_limits<std::uint64_t>::max() - type_rva) {
+            std::cout << "  no valid x64 RTTI locator (signature=0x" << std::hex << signature
+                      << ", typeRVA=0x" << type_rva << std::dec << ")\n";
+            continue;
+        }
+        const auto type_va = image_base + type_rva;
+        const auto descriptor = ReadVa(bytes, ranges, type_va, 16 + 256);
+        if (!descriptor) throw std::runtime_error("RTTI TypeDescriptor is not fully captured");
+        const std::string name = PrintableString(*descriptor, 16);
+        if (!name.starts_with(".?AV") && !name.starts_with(".?AU")) {
+            std::cout << "  unexpected TypeDescriptor at VA=0x" << std::hex << type_va
+                      << ": " << name << std::dec << '\n';
+            continue;
+        }
+        std::cout << "  locator=0x" << std::hex << locator_va << " type=0x" << type_va
+                  << std::dec << "\n  name=" << name << '\n';
+    }
+}
+
 void PrintDumpPointerChain(
     const std::filesystem::path& path,
     const std::uint64_t pointer_va,
