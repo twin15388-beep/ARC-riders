@@ -683,6 +683,148 @@ void PrintDumpGNamesCandidates(
               << " validated_candidates=" << candidates << '\n';
 }
 
+void PrintDumpFNamePool(
+    const std::filesystem::path& path,
+    const std::uint64_t image_base,
+    const std::uint64_t image_size) {
+    if (image_base == 0 || image_size == 0 || image_size > UINT64_MAX - image_base) {
+        throw std::invalid_argument("invalid image range for FName pool scan");
+    }
+    static constexpr std::array<std::string_view, 10> names{{
+        "World", "Actor", "Pawn", "GameInstance", "LocalPlayer",
+        "PlayerController", "PlayerCameraManager", "PersistentLevel",
+        "RootComponent", "/Script/Engine",
+    }};
+    struct Hit {
+        std::uint64_t entry;
+        std::uint64_t block;
+        std::uint32_t offset;
+        std::string_view name;
+    };
+    struct ChunksCandidate {
+        std::uint64_t address;
+        std::vector<std::uint64_t> blocks;
+    };
+    const auto heap = [&](const std::uint64_t address) {
+        return address >= 0x10000 && address <= 0x7FFFFFFFFFFF &&
+            (address < image_base || address >= image_base + image_size);
+    };
+    const MappedFile file(path);
+    const auto bytes = file.Bytes();
+    const auto ranges = ReadMemoryRanges(bytes, ReadStreams(bytes));
+    std::uint64_t scanned = 0;
+    std::uint64_t raw_hits = 0;
+    std::uint64_t filtered = 0;
+    std::vector<Hit> hits;
+    std::set<std::pair<std::uint64_t, std::string_view>> unique;
+    for (const auto& range : ranges) {
+        scanned += range.size;
+        if (range.size < 4) continue;
+        const auto data = bytes.subspan(
+            static_cast<std::size_t>(range.file_offset), static_cast<std::size_t>(range.size));
+        for (std::size_t position = 2; position < data.size(); ++position) {
+            for (const auto name : names) {
+                if (name.size() > 63 || position + name.size() > data.size() ||
+                    data[position] != static_cast<std::uint8_t>(name.front()) ||
+                    std::memcmp(data.data() + position, name.data(), name.size()) != 0) {
+                    continue;
+                }
+                ++raw_hits;
+                const auto header = U16(data.data() + position - 2);
+                if ((header & 1U) != 0 || (header >> 6) != name.size()) {
+                    ++filtered;
+                    continue;
+                }
+                const auto entry = range.va + position - 2;
+                const auto block = entry & ~std::uint64_t{0x1FFFF};
+                if (!heap(block) || !unique.emplace(entry, name).second ||
+                    !ReadVa(bytes, ranges, block, 0x20000)) {
+                    ++filtered;
+                    continue;
+                }
+                hits.push_back({entry, block, static_cast<std::uint32_t>(entry - block), name});
+            }
+        }
+    }
+    std::cout << "name scan bytes=" << scanned << " raw_hits=" << raw_hits
+              << " filtered=" << filtered << " unique_entries=" << hits.size() << '\n';
+    std::set<std::uint64_t> named_blocks;
+    for (const auto& hit : hits) named_blocks.insert(hit.block);
+    std::cout << "named_aligned_blocks=" << named_blocks.size() << '\n';
+
+    std::vector<ChunksCandidate> candidates;
+    std::uint64_t rejected_runs = 0;
+    for (const auto& range : ranges) {
+        if (range.size < 8 * 8) continue;
+        const auto data = bytes.subspan(
+            static_cast<std::size_t>(range.file_offset), static_cast<std::size_t>(range.size));
+        for (std::size_t position = 0; position + 8 * 8 <= data.size(); position += 8) {
+            const auto address = range.va + position;
+            if (!heap(address) || !named_blocks.contains(U64(data.data() + position))) continue;
+            if (position >= 8 && named_blocks.contains(U64(data.data() + position - 8))) continue;
+            std::vector<std::uint64_t> blocks;
+            while (position + blocks.size() * 8 + 8 <= data.size() && blocks.size() < 8192) {
+                const auto value = U64(data.data() + position + blocks.size() * 8);
+                if (!named_blocks.contains(value) || !ReadVa(bytes, ranges, value, 0x20000)) break;
+                blocks.push_back(value);
+            }
+            if (blocks.size() >= 8) candidates.push_back({address, std::move(blocks)});
+            else ++rejected_runs;
+        }
+    }
+    std::cout << "chunk runs rejected=" << rejected_runs
+              << " candidates_with_8plus_blocks=" << candidates.size() << '\n';
+
+    std::size_t validated_pools = 0;
+    for (const auto& candidate : candidates) {
+        for (const auto& range : ranges) {
+            if (range.size < 8) continue;
+            const auto data = bytes.subspan(
+                static_cast<std::size_t>(range.file_offset), static_cast<std::size_t>(range.size));
+            for (std::size_t position = 0; position + 8 <= data.size(); position += 8) {
+                if (U64(data.data() + position) != candidate.address) continue;
+                const auto pool = range.va + position;
+                if (!heap(pool)) {
+                    ++filtered;
+                    continue;
+                }
+                std::cout << "POOL CANDIDATE pool=0x" << std::hex << pool
+                          << " chunks=0x" << candidate.address << std::dec
+                          << " valid_blocks=" << candidate.blocks.size() << '\n';
+                std::size_t decoded = 0;
+                for (const auto& hit : hits) {
+                    const auto found = std::find(candidate.blocks.begin(), candidate.blocks.end(), hit.block);
+                    if (found == candidate.blocks.end()) continue;
+                    const auto block_index = static_cast<std::uint32_t>(found - candidate.blocks.begin());
+                    if ((hit.offset & 1U) != 0) continue;
+                    const auto index = (block_index << 16) | (hit.offset / 2);
+                    const auto entry = ReadVa(bytes, ranges, hit.block + hit.offset, 2 + hit.name.size());
+                    if (!entry) continue;
+                    const auto length = U16(entry->data()) >> 6;
+                    const bool match = static_cast<std::size_t>(length) == hit.name.size() &&
+                        std::memcmp(entry->data() + 2, hit.name.data(), hit.name.size()) == 0;
+                    std::cout << "  index=0x" << std::hex << index << std::dec
+                              << " expected=" << hit.name << " decoded=";
+                    std::cout.write(reinterpret_cast<const char*>(entry->data() + 2),
+                        static_cast<std::streamsize>(match ? length : 0));
+                    std::cout << (match ? " MATCH" : " FAIL") << '\n';
+                    decoded += match ? 1U : 0U;
+                }
+                if (decoded != 0) {
+                    ++validated_pools;
+                    std::cout << "PREDICATE PASS pool=0x" << std::hex << pool << std::dec
+                              << " decoded_names=" << decoded << '\n';
+                } else {
+                    std::cout << "PREDICATE FAIL: no USMAP name decoded\n";
+                }
+            }
+        }
+    }
+    std::cout << "SUMMARY scanned_bytes=" << scanned << " raw_hits=" << raw_hits
+              << " filtered=" << filtered << " chunk_candidates=" << candidates.size()
+              << " validated_pools=" << validated_pools << '\n';
+}
+
 void PrintDumpGObjectsCandidates(
     const std::filesystem::path& path,
     const std::uint64_t data_va,

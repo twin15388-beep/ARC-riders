@@ -43,6 +43,10 @@ void PrintDumpGNamesLazyCandidates(
     const std::filesystem::path& path,
     std::uint64_t image_base,
     std::uint64_t image_size);
+void PrintDumpFNamePool(
+    const std::filesystem::path& path,
+    std::uint64_t image_base,
+    std::uint64_t image_size);
 
 } // namespace arc
 

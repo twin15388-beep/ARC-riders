@@ -355,3 +355,7 @@ RTTI не подходит: у первого объекта locator=0; у ос�
 Полный GObjects scan дал 17 candidates, все `index5_valid=0`. После heap-filter были проверены четыре оставшихся first_chunk; они содержат x64 code, не UObject pointers. Все отклонены. `World?+0x158` также не Levels: это array сложных elements, вероятный stride `0x50`, с in-image vtables `0x14D6D0E60`, `0x14D6D0FF0`, `0x14D6D1310`. Levels/Actors всё ещё не подтверждены.
 
 Следующий метод: найти RIP-relative LEA references на стабильные vtables, перейти к constructors и восстановить protected object-header initialization. Добавлен `dump-rip-xrefs` для этого анализа.
+
+## 16. Целевой FNamePool predicate
+
+По прямому уточнению задачи constructor/viewport/chain работа приостановлена. Добавлен `dump-fname-pool <DMP> <ImageBase> <ImageSize>`: scan десяти известных USMAP ANSI names с проверкой FName header, block alignment `0x20000`, полного captured block, heap `Chunks[]` с минимум восемью валидными block pointers и heap pool reference. PASS выставляется только при повторном decode имени по `(blockIndex << 16) | (entryOffset / 2)` и точном совпадении с USMAP name. Вывод содержит scanned bytes, raw hits, filtered, rejected runs, chunk candidates и validated pools. Результат на `(3).DMP` ещё не получен.

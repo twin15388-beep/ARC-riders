@@ -35,6 +35,7 @@ void Usage() {
         << "arc_tool dump-strings <game.dmp> <text>  Find a string in captured memory\n"
         << "arc_tool dump-xrefs <game.dmp> <VA>      Find little-endian pointers to VA\n"
         << "arc_tool dump-rip-xrefs <game.dmp> <VA>  Find RIP-relative LEA references\n"
+        << "arc_tool dump-fname-pool <game.dmp> <base> <image_size>  Validate heap FNamePool\n"
         << "arc_tool dump-scan <game.dmp> <AOB>      Find an AOB pattern in captured memory\n"
         << "arc_tool dump-read <game.dmp> <VA> <size>  Hex-dump up to 4096 bytes\n"
         << "arc_tool dump-chain <game.dmp> <VA> [offset ...]  Read pointer, then pointer+offset steps\n"
@@ -197,6 +198,10 @@ int main(int argc, char** argv) {
         }
         if (argc == 4 && std::string_view(argv[1]) == "dump-xrefs") {
             arc::PrintDumpXrefs(argv[2], arc::ParseUnsigned(argv[3]));
+            return 0;
+        }
+        if (argc == 5 && std::string_view(argv[1]) == "dump-fname-pool") {
+            arc::PrintDumpFNamePool(argv[2], arc::ParseUnsigned(argv[3]), arc::ParseUnsigned(argv[4]));
             return 0;
         }
         if (argc == 4 && std::string_view(argv[1]) == "dump-rip-xrefs") {
