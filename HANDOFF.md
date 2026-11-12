@@ -148,3 +148,7 @@ The v3 chain scan (17,916,928 qwords; 25,905 pointer chains) found exactly one u
 The exact public viewport algorithm is implemented in `ArcDecrypt.*`: slot hashes the address `LocalPlayer+0xF0`; ciphertext is 16 bytes at `LocalPlayer+0x100+slot*0x20`; the seed is the address `base+0x10421C80`. A real-byte test now actually executes and verifies slot 2, key `0xA74474574EF90345`, and viewport `0x1DBDA3550`. The candidate has in-image vtable `0x14E20BE20`, but `Viewport+0x140 = 0x1F53F3D00`, not the chain endpoint `0x1F53F1D00`. Therefore viewport/world equivalence fails so far; read the second world candidate before naming either. Do not use the earlier invented SplitMix-based transform or claim its test passed.
 
 Next command: `dump-read <DMP> 0x1F53F3D00 0x600`. Compare it with captured `0x1F53F1D00` and inspect vtable/object relationships.
+
+## Viewport rejection after object read
+
+`0x1F53F3D00` (read through decrypted candidate `0x1DBDA3550+0x140`) has a zero first qword and a data-only `0x600`-byte body; it is not a UObject/UWorld. The public viewport transform deterministically produces `0x1DBDA3550` and that address has an in-image vtable, but the required World back-reference fails. Reject it as a validated GameViewportClient. The pointer chain remains only structurally supported; class names are still required. No usable viewport, SDK, GObjects, ESP, or gameplay behavior is validated.

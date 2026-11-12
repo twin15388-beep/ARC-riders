@@ -77,4 +77,4 @@ $d = "$env:USERPROFILE\AppData\Local\Temp\PioneerGame.DMP"
 
 ## Build-specific viewport candidate
 
-`ArcDecrypt.*` isolates the published CL-1450810 viewport transform. It accepts the complete `0x100`-byte bank at LocalPlayer `+0x100`; it does not read process memory or claim runtime validation. The public global and chain have structural support in one supplied dump. The decryptor has a real-byte vector test and produces an object-shaped viewport candidate; its World pointer currently differs from the pointer-chain endpoint, so class/world validation remains open.
+`ArcDecrypt.*` isolates the published CL-1450810 viewport transform. It accepts the complete `0x100`-byte bank at LocalPlayer `+0x100`; it does not read process memory or claim runtime validation. The public global and chain have structural support in one supplied dump. The decryptor has a real-byte vector test and produces an object-shaped viewport candidate; its World pointer targets a zero-vtable data block rather than UWorld, so it is rejected as a validated GameViewportClient.
