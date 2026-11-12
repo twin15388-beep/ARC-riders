@@ -402,10 +402,17 @@ void PrintDumpRtti(
         std::cout << "vtable=0x" << std::hex << vtable << std::dec << '\n';
         if (vtable < 8) throw std::invalid_argument("vtable address underflow");
         const auto locator_pointer = ReadVa(bytes, ranges, vtable - 8, 8);
-        if (!locator_pointer) throw std::runtime_error("RTTI locator pointer is not captured");
+        if (!locator_pointer) {
+            std::cout << "  locator pointer is not captured\n";
+            continue;
+        }
         const auto locator_va = U64(locator_pointer->data());
+        std::cout << "  locator pointer=0x" << std::hex << locator_va << std::dec << '\n';
         const auto locator = ReadVa(bytes, ranges, locator_va, 20);
-        if (!locator) throw std::runtime_error("RTTI CompleteObjectLocator is not captured");
+        if (!locator) {
+            std::cout << "  CompleteObjectLocator is not captured\n";
+            continue;
+        }
         const auto signature = U32(locator->data());
         const auto type_rva = U32(locator->data() + 12);
         if (signature != 1 || type_rva == 0 || image_base > std::numeric_limits<std::uint64_t>::max() - type_rva) {
@@ -415,7 +422,10 @@ void PrintDumpRtti(
         }
         const auto type_va = image_base + type_rva;
         const auto descriptor = ReadVa(bytes, ranges, type_va, 16 + 256);
-        if (!descriptor) throw std::runtime_error("RTTI TypeDescriptor is not fully captured");
+        if (!descriptor) {
+            std::cout << "  TypeDescriptor is not fully captured at VA=0x" << std::hex << type_va << std::dec << '\n';
+            continue;
+        }
         const std::string name = PrintableString(*descriptor, 16);
         if (!name.starts_with(".?AV") && !name.starts_with(".?AU")) {
             std::cout << "  unexpected TypeDescriptor at VA=0x" << std::hex << type_va
