@@ -152,3 +152,7 @@ Next command: `dump-read <DMP> 0x1F53F3D00 0x600`. Compare it with captured `0x1
 ## Viewport rejection after object read
 
 `0x1F53F3D00` (read through decrypted candidate `0x1DBDA3550+0x140`) has a zero first qword and a data-only `0x600`-byte body; it is not a UObject/UWorld. The public viewport transform deterministically produces `0x1DBDA3550` and that address has an in-image vtable, but the required World back-reference fails. Reject it as a validated GameViewportClient. The pointer chain remains only structurally supported; class names are still required. No usable viewport, SDK, GObjects, ESP, or gameplay behavior is validated.
+
+## Focused ESP handoff
+
+Current user request: consolidate only information useful to another engineer/AI for implementing ESP, Aim, Trigger, Minimap and ImGui menu UI. See `ESP_HANDOFF_RU.md`. It contains exact measured chain/vtables, dump/USMAP identities, rejected RTTI/GObjects/Levels/viewport paths, the pending FNamePool predicate and command, constructor lead `0x144C364EB`, per-feature missing data and the ordered recovery plan. No ESP/Aim/Trigger/Minimap runtime functionality exists or was observed in-game. Latest FNamePool executable SHA-256 is `9cbf241d21024442e16ee37e5150327f054d19da53e829d1072a47d83fc96d2c`; user accidentally ran an older executable, so the new FNamePool scan remains pending.
