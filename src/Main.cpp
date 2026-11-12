@@ -168,6 +168,12 @@ int main(int argc, char** argv) {
         if (argc == 3 && std::string_view(argv[1]) == "modules") {
             return Modules(ParsePid(argv[2]));
         }
+        if (argc >= 5 && std::string_view(argv[1]) == "file-rtti") {
+            std::vector<std::uint64_t> vtables;
+            for (int i = 4; i < argc; ++i) vtables.push_back(arc::ParseUnsigned(argv[i]));
+            arc::PrintPeRtti(argv[2], arc::ParseUnsigned(argv[3]), vtables);
+            return 0;
+        }
         if (argc == 3 && std::string_view(argv[1]) == "file") {
             arc::PrintPeFileInfo(argv[2]);
             return 0;

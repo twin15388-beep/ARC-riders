@@ -31,6 +31,10 @@ std::uint32_t U32(const std::uint8_t* p) {
         (static_cast<std::uint32_t>(p[3]) << 24);
 }
 
+std::uint64_t U64(const std::uint8_t* p) {
+    return static_cast<std::uint64_t>(U32(p)) | (static_cast<std::uint64_t>(U32(p + 4)) << 32);
+}
+
 void Require(const std::size_t offset, const std::size_t amount, const std::size_t size) {
     if (offset > size || amount > size - offset) {
         throw std::runtime_error("PE structure points outside the file");
@@ -170,6 +174,78 @@ void PrintPeFileInfo(const std::filesystem::path& path) {
     for (const auto& needle : needles) {
         std::cout << "string \"" << needle << "\":\n";
         PrintStringHits(bytes, needle);
+    }
+}
+
+} // namespace arc
+
+namespace arc {
+
+void PrintPeRtti(
+    const std::filesystem::path& path,
+    const std::uint64_t image_base,
+    const std::vector<std::uint64_t>& vtables) {
+    if (image_base == 0 || vtables.empty() || vtables.size() > 32) {
+        throw std::invalid_argument("file RTTI requires an image base and 1..32 vtables");
+    }
+    const MappedFile file(path);
+    const auto bytes = file.Bytes();
+    Require(0, 0x40, bytes.size());
+    if (bytes[0] != 'M' || bytes[1] != 'Z') throw std::runtime_error("not an MZ executable");
+    const auto nt = static_cast<std::size_t>(U32(bytes.data() + 0x3C));
+    Require(nt, 24, bytes.size());
+    const auto section_count = static_cast<std::size_t>(U16(bytes.data() + nt + 6));
+    const auto optional_size = static_cast<std::size_t>(U16(bytes.data() + nt + 20));
+    const auto optional = nt + 24;
+    Require(optional, optional_size, bytes.size());
+    const auto headers_size = static_cast<std::size_t>(U32(bytes.data() + optional + 60));
+    const auto sections = optional + optional_size;
+    Require(sections, section_count * 40, bytes.size());
+    auto file_offset = [&](const std::uint64_t va, const std::size_t amount) -> std::size_t {
+        if (va < image_base) throw std::runtime_error("RTTI address precedes image base");
+        const auto rva64 = va - image_base;
+        if (rva64 > 0xFFFFFFFFULL) throw std::runtime_error("RTTI RVA exceeds PE32+ range");
+        const auto rva = static_cast<std::size_t>(rva64);
+        if (rva < headers_size) {
+            Require(rva, amount, bytes.size());
+            return rva;
+        }
+        for (std::size_t i = 0; i < section_count; ++i) {
+            const auto section = sections + i * 40;
+            const auto start = static_cast<std::size_t>(U32(bytes.data() + section + 12));
+            const auto span = static_cast<std::size_t>(U32(bytes.data() + section + 8));
+            if (rva < start || rva - start > span || amount > span - (rva - start)) continue;
+            const auto raw = static_cast<std::size_t>(U32(bytes.data() + section + 20));
+            const auto raw_size = static_cast<std::size_t>(U32(bytes.data() + section + 16));
+            const auto delta = rva - start;
+            if (delta > raw_size || amount > raw_size - delta) throw std::runtime_error("RTTI RVA has no raw file bytes");
+            Require(raw + delta, amount, bytes.size());
+            return raw + delta;
+        }
+        throw std::runtime_error("RTTI RVA is outside PE sections");
+    };
+    for (const auto vtable : vtables) {
+        std::cout << "vtable=0x" << std::hex << vtable << std::dec << '\n';
+        try {
+            const auto locator_va = U64(bytes.data() + file_offset(vtable - 8, 8));
+            std::cout << "  locator=0x" << std::hex << locator_va << std::dec << '\n';
+            if (locator_va == 0) continue;
+            const auto locator_offset = file_offset(locator_va, 20);
+            const auto signature = U32(bytes.data() + locator_offset);
+            const auto type_rva = U32(bytes.data() + locator_offset + 12);
+            if (signature != 1 || type_rva == 0) {
+                std::cout << "  invalid x64 locator signature/TypeDescriptor RVA\n";
+                continue;
+            }
+            const auto type_va = image_base + type_rva;
+            const auto descriptor_offset = file_offset(type_va, 16);
+            const auto name_offset = descriptor_offset + 16;
+            Require(name_offset, 1, bytes.size());
+            const auto name = PrintableString(bytes, name_offset);
+            std::cout << "  type=0x" << std::hex << type_va << std::dec << "\n  name=" << name << '\n';
+        } catch (const std::exception& error) {
+            std::cout << "  error: " << error.what() << '\n';
+        }
     }
 }
 

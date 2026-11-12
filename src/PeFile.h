@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <span>
+#include <vector>
 
 #include <windows.h>
 
@@ -31,6 +32,10 @@ private:
 };
 
 void PrintPeFileInfo(const std::filesystem::path& path);
+void PrintPeRtti(
+    const std::filesystem::path& path,
+    std::uint64_t image_base,
+    const std::vector<std::uint64_t>& vtables);
 
 } // namespace arc
 
