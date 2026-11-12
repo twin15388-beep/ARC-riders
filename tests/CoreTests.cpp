@@ -5,6 +5,8 @@
 #include "ArcDecrypt.h"
 
 #include <cstdint>
+#include <cstring>
+#include <array>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -159,6 +161,22 @@ void TestUsmap() {
     std::filesystem::remove(path, error);
 }
 
+
+void TestViewportDecrypt() {
+    std::array<std::uint8_t, 0x100> bank{};
+    const std::uint64_t lo = 0xF7149774B727E060ULL, hi = 0x642BFE20256AF201ULL;
+    std::memcpy(bank.data() + 0x40, &lo, 8);
+    std::memcpy(bank.data() + 0x48, &hi, 8);
+    const auto value = arc::DecryptViewport1450810(0x1DBCF5730, 0x140000000, bank);
+    Check(value.slot == 2, "viewport hash slot");
+    Check(value.key == 0xA74474574EF90345ULL, "viewport key");
+    Check(value.address == 0x1DBDA3550, "viewport decrypted pointer");
+    ExpectThrow([&] {
+        (void)arc::DecryptViewport1450810(0x1DBCF5730, 0x140000000,
+            std::span<const std::uint8_t>(bank.data(), 0xFF));
+    }, "short viewport bank accepted");
+}
+
 } // namespace
 
 int main() {
@@ -167,6 +185,7 @@ int main() {
         TestNumbersAndChains();
         TestConfig();
         TestUsmap();
+        TestViewportDecrypt();
         std::cout << "All core checks passed\n";
         return 0;
     } catch (const std::exception& error) {

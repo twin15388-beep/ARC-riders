@@ -5,38 +5,40 @@
 #include <stdexcept>
 
 namespace arc {
-namespace {
-std::uint64_t Load64(std::span<const std::uint8_t> bytes, std::size_t offset) {
-    std::uint64_t value{};
-    std::memcpy(&value, bytes.data() + offset, sizeof(value));
-    return value;
-}
-std::uint64_t Rotl(std::uint64_t value, unsigned count) {
-    return (value << count) | (value >> (64U - count));
-}
-}
 
 ViewportCandidate DecryptViewport1450810(
     const std::uint64_t local_player,
     const std::uint64_t module_base,
     const std::span<const std::uint8_t> bank) {
     if (bank.size() < 0x100) throw std::invalid_argument("viewport bank requires 0x100 bytes");
-    // This seed is the address of module+0x10421C80, not a qword read from it.
+
+    std::uint32_t hash = static_cast<std::uint32_t>(local_player + 0xF0);
+    for (const unsigned rotation : {0x12U, 0x0DU, 0x12U, 0x0DU}) {
+        hash = std::rotl(hash, static_cast<int>(rotation)) * 0x01000193U + 0x3DF4F4F9U;
+    }
+    hash ^= hash >> 16;
+    const std::uint32_t slot = hash & 7U;
+
     const std::uint64_t seed = module_base + 0x10421C80ULL;
-    std::uint64_t key = (local_player ^ (seed + 0x41C64E6DULL)) + 0x9E3779B97F4A7C15ULL;
-    key = (key ^ (key >> 30)) * 0xBF58476D1CE4E5B9ULL;
-    key = (key ^ (key >> 27)) * 0x94D049BB133111EBULL;
-    key ^= key >> 31;
-    const std::uint32_t slot = ((static_cast<std::uint32_t>(local_player >> 3)) * 0x9E3779B1U) >> 29;
-    const std::size_t offset = static_cast<std::size_t>(slot) * 0x20;
-    const std::uint64_t a = Load64(bank, offset);
-    const std::uint64_t b = Load64(bank, offset + 8);
-    const std::uint64_t c = Load64(bank, offset + 0x10);
-    const std::uint64_t d = Load64(bank, offset + 0x18);
-    const std::uint64_t first = a ^ key ^ Rotl(key, 13);
-    const std::uint64_t second = b ^ std::rotr(key, 17) ^ key;
-    const std::uint64_t combined = first + second;
-    const std::uint64_t address = combined ^ Rotl(c ^ key, combined & 63U) ^ std::rotr(d ^ key, 29);
-    return {slot, key, address};
+    const std::uint64_t key = 0x96E1893DE50C3EC5ULL +
+        ((0xCA5DE8DA8DAF0350ULL ^ seed) | 1ULL) * seed;
+    std::uint64_t lo{};
+    std::uint64_t hi{};
+    std::memcpy(&lo, bank.data() + slot * 0x20U, sizeof(lo));
+    std::memcpy(&hi, bank.data() + slot * 0x20U + 8, sizeof(hi));
+
+    std::uint64_t value = lo + 0x672ADC2992A10C8BULL;
+    value = std::rotl(value, 0xB);
+    value *= 0x32B8790980D8F375ULL;
+    value += 0x691E76C372AC9E1FULL;
+    value ^= hi;
+    value += 0x98D5F1EA80D8F374ULL;
+    value = std::rotl(value, 0x35);
+    value *= 0x32B8790980D8F375ULL;
+    value += 0x691E76C372AC9E1FULL;
+    value ^= lo;
+    value ^= key;
+    return {slot, key, value};
 }
-}
+
+} // namespace arc
