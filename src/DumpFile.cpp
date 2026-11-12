@@ -329,6 +329,45 @@ void PrintDumpXrefs(const std::filesystem::path& path, const std::uint64_t targe
     std::cout << "hits=" << hits << (hits == 128 ? " (cap reached)" : "") << '\n';
 }
 
+void PrintDumpRipXrefs(const std::filesystem::path& path, const std::uint64_t target_va) {
+    if (target_va == 0) throw std::invalid_argument("RIP xref target VA must be nonzero");
+    const MappedFile file(path);
+    const auto bytes = file.Bytes();
+    const auto ranges = ReadMemoryRanges(bytes, ReadStreams(bytes));
+    std::size_t hits = 0;
+    std::cout << "RIP-relative LEA xrefs to VA=0x" << std::hex << target_va << std::dec << ":\n";
+    for (const auto& range : ranges) {
+        if (range.size < 7) continue;
+        const auto data = bytes.subspan(
+            static_cast<std::size_t>(range.file_offset), static_cast<std::size_t>(range.size));
+        for (std::size_t position = 0; position + 7 <= data.size() && hits < 128; ++position) {
+            if ((data[position] != 0x48 && data[position] != 0x4C) ||
+                data[position + 1] != 0x8D || (data[position + 2] & 0xC7) != 0x05) {
+                continue;
+            }
+            const auto displacement = static_cast<std::int64_t>(
+                static_cast<std::int32_t>(U32(data.data() + position + 3)));
+            const auto instruction_va = range.va + position;
+            const auto next_va = instruction_va + 7;
+            if ((displacement >= 0 && static_cast<std::uint64_t>(displacement) > UINT64_MAX - next_va) ||
+                (displacement < 0 && static_cast<std::uint64_t>(-displacement) > next_va)) {
+                continue;
+            }
+            const auto computed = displacement >= 0
+                ? next_va + static_cast<std::uint64_t>(displacement)
+                : next_va - static_cast<std::uint64_t>(-displacement);
+            if (computed != target_va) continue;
+            std::cout << "  instruction=0x" << std::hex << instruction_va
+                      << " bytes=" << static_cast<unsigned>(data[position]) << ' '
+                      << static_cast<unsigned>(data[position + 1]) << ' '
+                      << static_cast<unsigned>(data[position + 2]) << std::dec << '\n';
+            ++hits;
+        }
+        if (hits == 128) break;
+    }
+    std::cout << "hits=" << hits << (hits == 128 ? " (cap reached)" : "") << '\n';
+}
+
 void PrintDumpScan(const std::filesystem::path& path, const Pattern& pattern) {
     const MappedFile file(path);
     const auto bytes = file.Bytes();

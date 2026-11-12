@@ -345,3 +345,13 @@ decrypt-viewport <LocalPlayer> <ModuleBase> <0x100HexBytes>
 ## 14. Продолжение: RTTI resolver
 
 Добавлена команда `dump-rtti <DMP> <ImageBase> <VtableVA>...`. Она читает MSVC x64 `CompleteObjectLocator` через `vtable-8`, затем `TypeDescriptor` по RVA от image base и выводит decorated C++ class name. Это независимый от GNames/FNamePool способ проверить найденные vtables. На момент добавления результаты на игровом дампе ещё не получены.
+
+## 15. Полный gameplay dump `(3)`
+
+Новый dump сделан непосредственно в матче. Цепочка подтверждена повторно, но heap-адреса новые: `0x1390F2500 -> +0xA0 0x296F04ED0 -> +0x250 0x296A6A6F0 -> +0x160 0x7F9D55C0`. Vtables полностью совпали со старым dump: `0x14E03B0B0`, `0x14E2802E0`, `0x14D65BE30`, `0x14D8952A0`.
+
+RTTI не подходит: у первого объекта locator=0; у остальных предполагаемые locator-указатели ведут в code, а сигнатуры являются x64 instructions (`0x480A8B48`, `0xEC834856`), не MSVC CompleteObjectLocator. On-disk EXE содержит преобразованные/упакованные значения и не заменяет runtime RTTI.
+
+Полный GObjects scan дал 17 candidates, все `index5_valid=0`. После heap-filter были проверены четыре оставшихся first_chunk; они содержат x64 code, не UObject pointers. Все отклонены. `World?+0x158` также не Levels: это array сложных elements, вероятный stride `0x50`, с in-image vtables `0x14D6D0E60`, `0x14D6D0FF0`, `0x14D6D1310`. Levels/Actors всё ещё не подтверждены.
+
+Следующий метод: найти RIP-relative LEA references на стабильные vtables, перейти к constructors и восстановить protected object-header initialization. Добавлен `dump-rip-xrefs` для этого анализа.
