@@ -57,7 +57,39 @@ std::uint32_t ParsePid(const char* text) {
     return static_cast<std::uint32_t>(pid);
 }
 
+// The rights a protected game process grants usually depend on the caller holding SeDebugPrivilege,
+// which is *present but disabled* in an elevated shell by default. arc_tool probe reported all eight
+// rights with the privilege enabled and injection previously failed at VirtualAllocEx error 5 without
+// it, so enabling it here is part of the measurement rather than a convenience.
+void EnableDebugPrivilege() {
+    HANDLE token = nullptr;
+    if (!::OpenProcessToken(::GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
+        std::cout << "se_debug_privilege=open_token_failed win32_error=" << ::GetLastError() << '\n';
+        return;
+    }
+    LUID luid{};
+    if (!::LookupPrivilegeValueW(nullptr, SE_DEBUG_NAME, &luid)) {
+        std::cout << "se_debug_privilege=lookup_failed win32_error=" << ::GetLastError() << '\n';
+        ::CloseHandle(token);
+        return;
+    }
+    TOKEN_PRIVILEGES privileges{};
+    privileges.PrivilegeCount = 1;
+    privileges.Privileges[0].Luid = luid;
+    privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    if (!::AdjustTokenPrivileges(token, FALSE, &privileges, sizeof(privileges), nullptr, nullptr)) {
+        std::cout << "se_debug_privilege=adjust_failed win32_error=" << ::GetLastError() << '\n';
+    } else if (::GetLastError() == ERROR_NOT_ALL_ASSIGNED) {
+        std::cout << "se_debug_privilege=not_assigned (the shell is not elevated; run PowerShell as "
+                     "administrator)\n";
+    } else {
+        std::cout << "se_debug_privilege=enabled\n";
+    }
+    ::CloseHandle(token);
+}
+
 void Inject(const std::uint32_t pid, const std::filesystem::path& dll_path) {
+    EnableDebugPrivilege();
     const auto full_path = std::filesystem::canonical(dll_path);
     if (!std::filesystem::is_regular_file(full_path) || std::filesystem::file_size(full_path) == 0) {
         throw std::runtime_error("DLL path is not a nonempty regular file");
@@ -85,7 +117,15 @@ void Inject(const std::uint32_t pid, const std::filesystem::path& dll_path) {
     RemoteMemory remote_memory(process.Get(), ::VirtualAllocEx(
         process.Get(), nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
     if (remote_memory.Get() == nullptr) {
-        ThrowWin32("VirtualAllocEx failed");
+        const DWORD error = ::GetLastError();
+        std::string hint;
+        if (error == ERROR_ACCESS_DENIED) {
+            hint = " - the target denies remote allocation: run from an elevated PowerShell (the line "
+                   "above must say se_debug_privilege=enabled). If it is enabled and this still fails, "
+                   "the protection rejects remote memory, so use the reader + overlay path instead of "
+                   "injection and analyse the dump offline.";
+        }
+        ThrowWin32("VirtualAllocEx failed" + hint, error);
     }
     SIZE_T written = 0;
     if (!::WriteProcessMemory(process.Get(), remote_memory.Get(), native.c_str(), bytes, &written) || written != bytes) {

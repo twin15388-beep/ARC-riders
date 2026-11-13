@@ -137,6 +137,30 @@ Every value is an aligned captured heap pointer outside the image with a first-q
 
 Critical correction: earlier manual VA arithmetic was wrong by `0x100000`. `0x140000000 + 0x108FEEC0 = 0x1508FEEC0`, not `0x1509FEEC0`. The previous zero test used the wrong VA. Do not record public RVA `0x108FEEC0` as rejected; the scan independently recovered the correct VA.
 
+## Anchor suppression bug, injector privilege fix (2026-11-13, third run)
+
+The user's third run passed the dump-(2) block VA `0xA6A00000` as an explicit anchor against dump `(3)` and
+got `entries=0`, `bytes_before_block` of 64 zero bytes, `next=0x0` for every candidate header size and
+`scanned_bytes=0 marker_hits=0`. Two conclusions: heap VAs do not transfer between separate game sessions,
+so that run could not say anything about the codec; and my code had a real bug — a supplied anchor that
+decoded nothing was counted as an anchor, which suppressed marker discovery for the whole run. The anchor
+is now only counted when the stream is dense (`validated_anchors`), an empty anchor is still reported but
+discovery and the layout fallback run in the same pass, and the report distinguishes
+`discovered_anchors` / `dense` / `chain_validated`. Verified on synthetic dumps: dense case still
+`PREDICATE PASS blocks=3 names=210`; tail case now prints `discovered_anchors=0 dense=0` plus the
+`ascii_run`/`partial` layout sections; uncaptured anchor prints `captured=no` and continues; the marker
+list is forwarded from the CLI.
+
+The injector's old `VirtualAllocEx` error 5 has a concrete explanation: `src/Injector.cpp` never enabled
+`SeDebugPrivilege`, and in an elevated shell that privilege is present but *disabled* by default.
+`arc_inject` now enables it first and prints `se_debug_privilege=enabled` or
+`not_assigned (the shell is not elevated)`, and on error 5 it prints what to do instead. Rebuilt:
+`957,440` bytes, sha256 `4e35e4a10c5e6a28b3a43c80734884258a0d7c47d49cfbb052287397e794f3ce`, uploaded over
+the zip copy at `/Dumper7-ARC-Raiders/arc_inject.exe` (rev `66026fcf2d8d04b309220`) — same source, not the
+same bytes as the file inside the zip. `arc_tool.exe` build `2026-11-13-markers-priv`: `1,250,304` bytes,
+sha256 `d29c7d6afcb9d9a840a5e2de38dc9366099226b2c702ba2d48cc3f2533daa04f`, rev `66026fc83cc584b309220`.
+Core tests pass strict and under ASan/UBSan; nothing has been run in game.
+
 ## Shortest next verification step
 
 Hex-dump 0x400 bytes at step0, 0x500 at step1, 0x300 at step2, 0x600 at step3, and 0x20 at `0x150421C80` (public viewport key-material candidate). Validate vtables, controller/local-player relationships, world/level/game-instance pointers and the encrypted viewport bank. No ESP or gameplay reads until these checks succeed.
@@ -324,6 +348,30 @@ real stride is visible instead of a bare `anchors=0`. Core tests (including `Tes
 strict and under ASan/UBSan. Windows build: Zig `x86_64-windows-gnu`, `-Werror`, exit 0, size
 `1,245,184`, SHA-256 `17ed9f27a15d91762c6fdd82626e382cbcdca77af81d2e64f8b610f492fa17c1`, stamp
 `2026-11-13-layout-probe`, MZ/PE/AMD64/PE32+ checked by hand. Not run in game.
+
+## Anchor suppression bug, injector privilege fix (2026-11-13, third run)
+
+The user's third run passed the dump-(2) block VA `0xA6A00000` as an explicit anchor against dump `(3)` and
+got `entries=0`, `bytes_before_block` of 64 zero bytes, `next=0x0` for every candidate header size and
+`scanned_bytes=0 marker_hits=0`. Two conclusions: heap VAs do not transfer between separate game sessions,
+so that run could not say anything about the codec; and my code had a real bug — a supplied anchor that
+decoded nothing was counted as an anchor, which suppressed marker discovery for the whole run. The anchor
+is now only counted when the stream is dense (`validated_anchors`), an empty anchor is still reported but
+discovery and the layout fallback run in the same pass, and the report distinguishes
+`discovered_anchors` / `dense` / `chain_validated`. Verified on synthetic dumps: dense case still
+`PREDICATE PASS blocks=3 names=210`; tail case now prints `discovered_anchors=0 dense=0` plus the
+`ascii_run`/`partial` layout sections; uncaptured anchor prints `captured=no` and continues; the marker
+list is forwarded from the CLI.
+
+The injector's old `VirtualAllocEx` error 5 has a concrete explanation: `src/Injector.cpp` never enabled
+`SeDebugPrivilege`, and in an elevated shell that privilege is present but *disabled* by default.
+`arc_inject` now enables it first and prints `se_debug_privilege=enabled` or
+`not_assigned (the shell is not elevated)`, and on error 5 it prints what to do instead. Rebuilt:
+`957,440` bytes, sha256 `4e35e4a10c5e6a28b3a43c80734884258a0d7c47d49cfbb052287397e794f3ce`, uploaded over
+the zip copy at `/Dumper7-ARC-Raiders/arc_inject.exe` (rev `66026fcf2d8d04b309220`) — same source, not the
+same bytes as the file inside the zip. `arc_tool.exe` build `2026-11-13-markers-priv`: `1,250,304` bytes,
+sha256 `d29c7d6afcb9d9a840a5e2de38dc9366099226b2c702ba2d48cc3f2533daa04f`, rev `66026fc83cc584b309220`.
+Core tests pass strict and under ASan/UBSan; nothing has been run in game.
 
 ## Shortest next verification step
 

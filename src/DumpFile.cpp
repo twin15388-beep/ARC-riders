@@ -1202,6 +1202,9 @@ void PrintDumpFNameBlocks(
     std::cout << "\" captured_ranges=" << ranges.size() << '\n';
 
     std::vector<AnchorHit> anchors;
+    // A supplied anchor that decodes nothing is still worth reporting (it is evidence about that VA),
+    // but it must not suppress marker discovery or the layout fallback: only a dense stream does that.
+    std::size_t validated_anchors = 0;
     std::vector<PartialHit> partials;  // best decoders that missed the strict gate, for layout reading
     std::vector<RunHit> run_hits;      // header-format independent candidates, ranked by string density
     constexpr std::size_t max_partials = 8;
@@ -1239,13 +1242,17 @@ void PrintDumpFNameBlocks(
                 }
             }
         }
+        if (anchor.entries >= min_entries) {
+            ++validated_anchors;
+        }
         anchors.push_back(std::move(anchor));
         }
     }
-    if (anchors.empty()) {
+    const std::size_t supplied_anchors = anchors.size();
+    if (validated_anchors == 0) {
         // Each engine-core name is searched separately, so "the pool is not captured here" and "the
         // entry header is different" produce different reports.
-        for (std::size_t marker_index = 0; marker_index < markers.size() && anchors.empty(); ++marker_index) {
+        for (std::size_t marker_index = 0; marker_index < markers.size() && validated_anchors == 0; ++marker_index) {
             const std::string& expected_first = markers[marker_index];
             std::vector<std::uint8_t> needle;
             needle.reserve(expected_first.size() + 1);
@@ -1350,15 +1357,18 @@ void PrintDumpFNameBlocks(
                                 }
                             }
                         }
+                        if (anchor.entries >= min_entries) {
+                            ++validated_anchors;
+                        }
                         anchors.push_back(std::move(anchor));
                         break;
                     }
-                    if (anchors.size() >= max_anchors) {
+                    if (anchors.size() >= max_anchors + supplied_anchors) {
                         break;
                     }
                     current = found + 1;
                 }
-                if (anchors.size() >= max_anchors) {
+                if (anchors.size() >= max_anchors + supplied_anchors) {
                     break;
                 }
             }
@@ -1368,8 +1378,11 @@ void PrintDumpFNameBlocks(
         for (std::size_t index = 0; index < markers.size(); ++index) {
             std::cout << (index == 0 ? "" : ",") << markers[index] << "=" << marker_hits_for[index];
         }
-        std::cout << ") region_probes=" << region_probes << " anchors=" << anchors.size()
-                  << (anchors.size() >= max_anchors ? " (anchor cap reached)" : "") << '\n';
+        std::cout << ") region_probes=" << region_probes
+                  << " discovered_anchors=" << anchors.size() - supplied_anchors
+                  << " dense=" << validated_anchors
+                  << (anchors.size() >= max_anchors + supplied_anchors ? " (anchor cap reached)" : "")
+                  << '\n';
     }
     for (const auto& anchor : anchors) {
         std::cout << "anchor block_data=0x" << std::hex << anchor.data_va << std::dec
@@ -1384,7 +1397,7 @@ void PrintDumpFNameBlocks(
             }
         }
     }
-    if (anchors.empty()) {
+    if (validated_anchors == 0) {
         for (const auto& run : run_hits) {
             std::cout << "  ascii_run block_base=0x" << std::hex << run.base << std::dec << " runs="
                       << run.runs << " string_to_string=";
@@ -1411,7 +1424,9 @@ void PrintDumpFNameBlocks(
         }
         std::cout << "  read one of these regions in full with: dump-fname-layout <dmp> <block_base> "
                   << layout_window << " 512\n";
-        std::cout << "SUMMARY build=" << kBuildStamp << " anchors=0 validated_pools=0\n";
+        std::cout << "SUMMARY build=" << kBuildStamp << " anchors=" << anchors.size() - supplied_anchors
+                  << " validated_pools=0 (supplied anchor: " << (supplied_anchors ? "decoded no dense stream" : "not searched")
+                  << ")\n";
         std::cout << "next: no block whose first entry decodes as \"" << markers.front() << "\" with "
                   << min_entries << "+ entries exists in the captured memory. Dump the bytes around a"
                      " known name (dump-read on the block VA from the previous notes) to read the real"
@@ -1558,9 +1573,21 @@ void PrintDumpFNameBlocks(
                          " block-linking assumption is wrong for this build.\n";
         }
     }
-    std::cout << "\nSUMMARY build=" << kBuildStamp << " anchors=" << anchors.size()
-              << " validated_pools=" << validated_pools << " scanned_bytes=" << scanned_bytes
-              << " marker_hits=" << marker_hits << " region_probes=" << region_probes << '\n';
+    std::cout << "\nSUMMARY build=" << kBuildStamp
+              << " anchors_found=" << anchors.size() - supplied_anchors
+              << " dense=" << validated_anchors
+              << " chain_validated=" << validated_pools
+              << " scanned_bytes=" << scanned_bytes << " marker_hits=" << marker_hits << " (";
+    for (std::size_t index = 0; index < markers.size(); ++index) {
+        std::cout << (index == 0 ? "" : ",") << markers[index] << "=" << marker_hits_for[index];
+    }
+    std::cout << ") region_probes=" << region_probes << '\n';
+    if (supplied_anchors != 0 && validated_anchors == 0) {
+        std::cout << "note: the supplied anchor VA decoded no dense name stream, so marker discovery ran"
+                     " in the same pass. A heap VA from another session's dump is not expected to hold"
+                     " the pool here; a hit list of zero for every marker is what says the pool is"
+                     " absent or encoded.\n";
+    }
     std::cout << "note: an in-image referrer gives an RVA that survives restarts, a heap referrer does"
                  " not. Decoded names prove the pool layout only; no object header field is implied.\n";
 }

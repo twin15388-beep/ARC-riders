@@ -191,68 +191,59 @@ Object + 0x18 = 0
 - health/team/bones;
 - GameViewportClient.
 
-## 6. FNamePool recovery — актуальный шаг (2026-11-13, после второго прогона)
+## 6. FNamePool recovery — актуальный шаг (2026-11-13, третий прогон)
 
-Прогон `2026-11-13-layout-probe` на `PioneerGame (3).DMP` дал `anchors=0`, но на этот раз с измеренным
-объяснением. Плотнее всего оказались две соседние области кучи:
+Третий прогон (`2026-11-13-markers-dumper`, якорь `0xA6A00000` в дампе `(3)`):
 
 ```text
-ascii_run block_base=0x30a9218b runs=93 string_to_string=0x5x19,0x4x13,0x6x7,0x20x6 first="None"
-    head=00034e6f6e65004e6f6e65006e6f6e65000343616e0043616e6f6e6963616c0063616e0003436f6d00436f6d70617400636f6d0003456e6300436972636c6500
+note: the supplied VA does not decode as a dense name stream from offset 0; continuing with the measured codec for the chain only
+anchor block_data=0xa6a00000 codec=measured_shift6_wide0_str2 entries=0 consumed=0x0
+  bytes_before_block=0000...0000 (64 zero bytes)
+  probe header=0xa69ffff8..0xa69fffd0 header_size=0x8..0x30 captured=1 next=0x0 next_is_block=0 next_entries=0
+  referrers image=0 heap=0
+PREDICATE FAIL: single block only, 0 names decoded from the anchor.
+SUMMARY build=2026-11-13-markers-dumper anchors=1 validated_pools=0 scanned_bytes=0 marker_hits=0 region_probes=0
 ```
 
-Разбор байтов: это НЕ FName-блок. Это таблица вида `[0x03][строка A][00][строка B][00][строка A в нижнем
-регистре][00]` повторяющаяся: `None/None/none`, `Can/Canonical/can`, `Com/Compat/com`, `Enc/Circle/enc`.
-Однобайтовый префикс, три строки на запись, шаг 4–6 байт между строками — это строковый индекс (алиасы /
-автодополнение), а не записи `FNameEntry`. То есть 1140 маркеров `None\0` в этом дампе привели в чужую
-таблицу, а `partial ... len=1` отчёты в диапазонах `0x7ff8...`/`0x7fff...` — мусор от обоих кодеков на
-ASCII системных DLL. Вывод: в этом дампе ни одна область не начинается с открытого `None` как записи
-пула имён, поэтому поиск по одному маркеру не различает «пул не попал в дамп» и «имена закодированы».
+Что это значит по порядку. (1) `0xA6A00000` — heap-адрес из дампа `(2)`, а `(3)` это другой запуск игры,
+поэтому ожидать там пула на том же VA нельзя: тест ничего не сказал ни про покрытие, ни про кодировку.
+(2) Запись `bytes_before_block` из 64 нулей и `next=0x0` при всех шести размерах заголовка говорят, что в
+`(3)` эта область просто пуста. (3) Настоящий баг был в моём коде: `anchors=1 validated_pools=0` при
+`scanned_bytes=0 marker_hits=0` — выданный якорь, который ничего не декодировал, подавлял поиск по
+маркерам, поэтому `dump (3)` так и не был просмотрен.
 
-Инструмент изменён ровно под это различение:
+Исправлено (тот же файл, сборка `2026-11-13-markers-priv`):
 
-- `dump-fname-blocks` теперь ищет несколько маркеров (`None,ByteProperty,IntProperty,FloatProperty,
-  ObjectProperty,Class`, переопределяется 5-м аргументом) и печатает число попаданий по каждому:
-  `marker_hits=1140 (None=1140,ByteProperty=...)`. Ноль по всем шести — это факт про покрытие/шифрование,
-  а не про кодировку заголовка;
-- явный `block0_VA` больше не прерывает запуск: если область не захвачена, печатается
-  `anchor=0x... captured=no (this dump does not contain the region; falling back to marker discovery)`
-  и поиск по маркерам продолжается в том же прогоне;
-- `dump-fname-layout` / `live-fname-layout` (общий `arc::PrintNameLayout`) остаются измерением раскладки
-  по любому адресу.
+- якорь из CLI считается валидным только если поток плотный (`entries >= min_entries`); пустой якорь
+  печатается как отчёт про эту область, но поиск по маркерам и секция раскладки выполняются в том же
+  прогоне (`validated_anchors` вместо `anchors.empty()` как условие, `discovered_anchors=`/`dense=` в
+  строке discovery, `anchors_found=/dense=/chain_validated=` в SUMMARY);
+- проверено на синтетике: плотный дамп `PREDICATE PASS blocks=3 names=210` (без регрессии), дамп с
+  хвостом в записе теперь даёт `discovered_anchors=0 dense=0` + `ascii_run ... runs=64` +
+  `partial ... gaps=0x10x63` вместо молчаливого `anchors=1`, незахваченный якорь печатает `captured=no`
+  и продолжает, список маркеров пробрасывается из CLI (`markers="Wnt5x","Stat000"`).
 
-`Dumper7-ARC-Raiders.zip` распакован в Dropbox как `/Dumper7-ARC-Raiders/` — и это НЕ вывод дампера, а
-пакет для запуска внутри процесса: `arc_inject.exe` (956 416) + `Dumper-7.dll` (2 995 200) +
-`Dumper-7.ini` (119) + `README.txt` (798). ini: `SDKGenerationPath=C:/Dumper-7`,
-`LogFilePath=C:/Dumper-7/dumper7.log`, `ShouldAutoUnload=1`. README описывает запуск на главном меню с
-последующей генерацией SDK. `src/Injector.cpp` в репозитории — это и есть `arc_inject.exe`:
-`OpenProcess(PROCESS_CREATE_THREAD|QUERY_INFORMATION|VM_OPERATION|VM_WRITE|VM_READ)` → `VirtualAllocEx` →
-`WriteProcessMemory` → `CreateRemoteThread(kernel32!LoadLibraryW)` → `WaitForSingleObject` 60 с →
-`GetExitCodeThread`. Раньше этот путь падал на `VirtualAllocEx` error 5; `probe` показал, что сейчас
-выданы `VM_WRITE`, `CREATE_THREAD`, `SUSPEND_RESUME` и что `SeDebugPrivilege` включён, — то есть у inject
-появился реальный шанс, и это самый короткий путь к настоящим именам классов: Dumper-7 читает `FNamePool`
-самим движком, ему не нужен наш заголовок записи.
+Параллельно найдено, почему дамп-пакет в своё время не заработал: `src/Injector.cpp` открывал процесс без
+включения `SeDebugPrivilege`, а в повышенной оболочке он «присутствует, но выключен» — ровно то, из-за
+чего `VirtualAllocEx` даёт error 5. Теперь `arc_inject` включает привилегию сам и печатает
+`se_debug_privilege=enabled` / `not_assigned (the shell is not elevated)`, а при error 5 выводит
+объяснение и альтернативу (внешняя читалка + offline-разбор дампа). Сборка: `957 440` байта, загружен в
+`/Dumper7-ARC-Raiders/arc_inject.exe` (rev `66026fcf2d8d04b309220`) поверх копии из zip — тот же исходник,
+но побайтово другой файл, поэтому путать их не стоит.
 
-Решение по архитектуре зафиксировано прогоном `probe`: внешний читалка + overlay (все 8 прав, 5/5
-чтений приватных областей, MZ в image base). Live `image_base=0x7ff7e6370000` (ASLR) — любое число из
-дампа пересчитывается через живую базу; `SizeOfImage` теперь берётся из заголовка образа в памяти
-(`live_pe_headers`), а обход PEB сверяется с Toolhelp (`peb_walk validation`).
+Порядок действий, который остаётся: `(3)` пересмотреть поиском по шести маркерам БЕЗ якоря, `(2)` (если
+ещё на диске) прогнать С якорем `0xA6A00000` — вот там он и должен был декодироваться; и запустить
+Dumper-7 на главном меню, чтобы имена классов достались от самого движка. `probe` в прошлый раз не
+дошёл: `Start-Process -Verb RunAs` в Windows PowerShell 5.1 нельзя совместить с `-RedirectStandardOutput`
+(`AmbiguousParameterSet`), редирект делается через `cmd /c` в повышенном окне.
 
-```powershell
-.\arc_tool.exe version    # жду build=2026-11-13-markers-dumper
-.\arc_tool.exe dump-fname-blocks "C:\Users\Malin\AppData\Local\Temp\PioneerGame (3).DMP" 0x140000000 0x139F9000 0xA6A00000
-```
+Сборки в Dropbox: `/arc_tool.exe` `1 250 304` байта, sha256
+`d29c7d6afcb9d9a840a5e2de38dc9366099226b2c702ba2d48cc3f2533daa04f`, stamp `2026-11-13-markers-priv`,
+rev `66026fc83cc584b309220`. Локально в репозитории те же файлы — `out/arc_tool.exe`, `out/arc_inject.exe`
+(`957 440`, sha256 `4e35e4a10c5e6a28b3a43c80734884258a0d7c47d49cfbb052287397e794f3ce`).
 
-Сборка в Dropbox: `/arc_tool.exe`, размер `1 249 792`, SHA-256
-`cfe3538fe16c3f55538c96d1f94daefbb9bab6d43803140aa5bf4f10d5a646c8`, stamp `2026-11-13-markers-dumper`
-(rev `66026a80b3d314b309220`). Локально те же исходники дают и `out/arc_inject.exe` (956 416,
-SHA-256 `2d9274c0ddec95dd6e87c402d1d4603559bf1b9bc4857f1cbea31b2f6eb4945c`) — тот же `src/Injector.cpp`,
-что и в zip, но не побайтово тот же файл.
-
-Проверено: `All core checks passed` (strict и ASan/UBSan); на плотном синтетическом дампе
-`PREDICATE PASS blocks=3 names=210` без регрессии; на дампе с «хвостом» в записи — `ascii_run ... runs=64`
-+ `partial ... gaps=0x10x63`; на незахваченном якоре — `captured=no` и продолжение поиска вместо abort;
-`discovery` печатает разбивку по маркерам. В live game ничего не запускалось.
+`All core checks passed` (strict и ASan/UBSan). В live game ничего не запускалось; ESP, Aim, Trigger,
+Minimap и меню по-прежнему не реализованы.
 
 
 ## 7. Constructor lead, если FNamePool predicate не пройден
@@ -392,9 +383,11 @@ https://www.dropbox.com/scl/fi/37w7un59wy4kc3slpw5xs/arc_tool.exe?rlkey=oes20rpm
 Актуальная версия (2026-11-13, `dump-fname-blocks` + `dump-fname-layout` + `live-fname-layout` + `probe`):
 
 ```text
-Size:    1249792 bytes
-SHA-256: cfe3538fe16c3f55538c96d1f94daefbb9bab6d43803140aa5bf4f10d5a646c8
-build stamp: 2026-11-13-markers-dumper
+Size:    1250304 bytes
+SHA-256: d29c7d6afcb9d9a840a5e2de38dc9366099226b2c702ba2d48cc3f2533daa04f
+build stamp: 2026-11-13-markers-priv
+arc_inject.exe: 957440 bytes
+SHA-256: 4e35e4a10c5e6a28b3a43c80734884258a0d7c47d49cfbb052287397e794f3ce
 ```
 
 Build выполнен Zig `x86_64-windows-gnu`, C++20, static, strict `-Werror`, exit code `0`. Portable core tests прошли. FNamePool scan на реальном dump ещё не запускался из-за запуска пользователем старого EXE. Ничего не проверено в live game.
