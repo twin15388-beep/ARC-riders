@@ -2,8 +2,10 @@
 
 #include "DumpFile.h"
 
+#include "Names.h"
 #include "PeFile.h"
 #include "Process.h"
+#include "Version.h"
 
 #include <algorithm>
 #include <array>
@@ -1053,6 +1055,374 @@ void PrintDumpGNamesLazyCandidates(
         }
     }
     std::cout << "matching_lea_pairs=" << pairs << " validated_candidates=" << candidates << '\n';
+}
+
+namespace {
+
+// Longest contiguous captured run starting at va, capped at size. nullopt means nothing is captured at
+// va; a span shorter than size means the dump only captured part of the region.
+[[nodiscard]] std::optional<std::span<const std::uint8_t>> ReadCaptured(
+    const std::span<const std::uint8_t> bytes,
+    const std::vector<MemoryRange>& ranges,
+    const std::uint64_t va,
+    const std::uint64_t size) {
+    if (va == 0 || size == 0 || size > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+        return std::nullopt;
+    }
+    const auto next = std::upper_bound(ranges.begin(), ranges.end(), va,
+        [](const std::uint64_t address, const MemoryRange& range) { return address < range.va; });
+    if (next == ranges.begin()) {
+        return std::nullopt;
+    }
+    const auto& range = *std::prev(next);
+    if (va < range.va || va - range.va >= range.size) {
+        return std::nullopt;
+    }
+    const auto available = range.size - (va - range.va);
+    const auto length = std::min(size, available);
+    return std::span<const std::uint8_t>(
+        bytes.data() + static_cast<std::size_t>(range.file_offset + (va - range.va)),
+        static_cast<std::size_t>(length));
+}
+
+void PrintHexWindow(std::string_view label, const std::optional<std::span<const std::uint8_t>>& data) {
+    std::cout << "  " << label << '=';
+    if (!data) {
+        std::cout << "uncaptured\n";
+        return;
+    }
+    for (const auto byte : *data) {
+        std::cout << std::hex << std::setw(2) << std::setfill('0') << static_cast<std::uint32_t>(byte)
+                  << std::dec << std::setfill(' ');
+    }
+    std::cout << " (" << data->size() << " bytes)\n";
+}
+
+struct AnchorHit {
+    std::uint64_t data_va{};      // first FName entry of the block
+    const NameCodec* codec{};
+    std::uint32_t entries{};
+    std::uint32_t consumed{};
+    bool capped{};
+    // name -> (block 0 pool index), filled only when the block starts with the empty name. The pool
+    // index is what a UObject's FName comparison field stores: (block << 16) | (entry_offset / 2).
+    std::vector<std::pair<std::string, std::uint32_t>> block0_indices;
+};
+
+constexpr std::array<std::string_view, 9> kWantedNames{{
+    "World", "Actor", "Pawn", "GameInstance", "LocalPlayer", "PlayerController",
+    "PlayerCameraManager", "PersistentLevel", "RootComponent",
+}};
+
+} // namespace
+
+// Recovers the FName pool from a block whose entry stream can actually be decoded, instead of searching
+// for a global by shape. Block 0 starts with the empty name, so locating that string and walking
+// forward is enough to identify the block; the block chain then yields every name.
+void PrintDumpFNameBlocks(
+    const std::filesystem::path& path,
+    const std::uint64_t image_base,
+    const std::uint64_t image_size,
+    const std::uint64_t anchor_data_va,
+    const std::uint32_t block_size,
+    const std::uint32_t min_entries,
+    const std::size_t max_blocks) {
+    if (image_base == 0 || image_size == 0 || image_size > std::numeric_limits<std::uint64_t>::max() - image_base) {
+        throw std::invalid_argument("invalid image range for FName block scan");
+    }
+    if (block_size < 0x1000 || block_size > 0x1000000) {
+        throw std::invalid_argument("block_size must be 0x1000..0x1000000");
+    }
+    if (min_entries < 4) {
+        throw std::invalid_argument("min_entries must be at least 4");
+    }
+    if (max_blocks == 0 || max_blocks > 4096) {
+        throw std::invalid_argument("max_blocks must be 1..4096");
+    }
+    constexpr std::string_view kExpectedFirst{"None"};
+    constexpr std::array<std::uint32_t, 6> kProbeSizes{{0x8, 0x10, 0x18, 0x20, 0x28, 0x30}};
+    constexpr std::size_t max_anchors = 16;
+    constexpr std::size_t entry_cap = 8192;
+    constexpr std::size_t referrer_cap = 128;
+
+    const MappedFile file(path);
+    const auto bytes = file.Bytes();
+    const auto ranges = ReadMemoryRanges(bytes, ReadStreams(bytes));
+    const auto read = [&](const std::uint64_t va, const std::uint64_t size) {
+        return ReadCaptured(bytes, ranges, va, size);
+    };
+    const auto image_end = image_base + image_size;
+    const auto in_image = [&](const std::uint64_t va) { return va >= image_base && va < image_end; };
+
+    std::cout << "build=" << kBuildStamp << "\nblock_size=0x" << std::hex << block_size
+              << std::dec << " min_entries=" << min_entries << " expected_first=\"" << kExpectedFirst
+              << "\" captured_ranges=" << ranges.size() << '\n';
+
+    std::vector<AnchorHit> anchors;
+    std::set<std::uint64_t> seen_bases;
+    std::uint64_t scanned_bytes = 0;
+    std::uint64_t marker_hits = 0;
+    std::uint64_t region_probes = 0;
+    if (anchor_data_va != 0) {
+        const auto block = read(anchor_data_va, block_size);
+        if (!block) {
+            throw std::runtime_error("the supplied block data VA is not captured in this dump");
+        }
+        const auto walk = DetectNameBlock(*block, kNameCodecCandidates, "", min_entries, entry_cap);
+        if (walk.codec == nullptr) {
+            std::cout << "note: the supplied VA does not decode as a dense name stream from offset 0;"
+                         " continuing with the measured codec for the chain only\n";
+        }
+        AnchorHit anchor{
+            anchor_data_va,
+            walk.codec ? walk.codec : &kNameCodecMeasured,
+            static_cast<std::uint32_t>(walk.entries.size()),
+            walk.consumed,
+            walk.cap_reached,
+            {},
+        };
+        if (!walk.entries.empty() && walk.entries.front().text == kExpectedFirst) {
+            for (const auto& entry : walk.entries) {
+                for (const auto wanted : kWantedNames) {
+                    if (entry.text == wanted) {
+                        anchor.block0_indices.emplace_back(std::string(wanted), (entry.offset / 2U));
+                    }
+                }
+            }
+        }
+        anchors.push_back(std::move(anchor));
+    } else {
+        std::vector<std::uint8_t> marker;
+        marker.reserve(kExpectedFirst.size() + 1);
+        marker.assign(kExpectedFirst.begin(), kExpectedFirst.end());
+        marker.push_back(0);
+        const auto searcher = std::boyer_moore_searcher(marker.begin(), marker.end());
+        for (const auto& range : ranges) {
+            scanned_bytes += range.size;
+            if (range.size < marker.size()) {
+                continue;
+            }
+            const auto data = bytes.subspan(
+                static_cast<std::size_t>(range.file_offset), static_cast<std::size_t>(range.size));
+            for (auto current = data.begin(); current != data.end();) {
+                const auto found = std::search(current, data.end(), searcher);
+                if (found == data.end()) {
+                    break;
+                }
+                ++marker_hits;
+                const auto string_at = static_cast<std::size_t>(found - data.begin());
+                for (const auto& codec : kNameCodecCandidates) {
+                    if (string_at < codec.string_offset) {
+                        continue;
+                    }
+                    const auto base = range.va + string_at - codec.string_offset;
+                    if (base < 0x10000 || !seen_bases.insert(base).second) {
+                        continue;
+                    }
+                    const auto block = read(base, block_size);
+                    if (!block || block->size() < block_size / 2) {
+                        continue;
+                    }
+                    ++region_probes;
+                    const auto walk = WalkNameBlock(*block, codec, entry_cap);
+                    if (walk.entries.empty() || walk.entries.front().text != kExpectedFirst ||
+                        walk.entries.size() < min_entries) {
+                        continue;
+                    }
+                    AnchorHit anchor{
+                        base, &codec, static_cast<std::uint32_t>(walk.entries.size()), walk.consumed,
+                        walk.cap_reached, {},
+                    };
+                    for (const auto& entry : walk.entries) {
+                        for (const auto wanted : kWantedNames) {
+                            if (entry.text == wanted) {
+                                anchor.block0_indices.emplace_back(
+                                    std::string(wanted), entry.offset / 2U);
+                            }
+                        }
+                    }
+                    anchors.push_back(std::move(anchor));
+                    break;
+                }
+                if (anchors.size() >= max_anchors) {
+                    break;
+                }
+                current = found + 1;
+            }
+            if (anchors.size() >= max_anchors) {
+                break;
+            }
+        }
+        std::cout << "discovery scanned_bytes=" << scanned_bytes << " marker_hits=" << marker_hits
+                  << " region_probes=" << region_probes << " anchors=" << anchors.size()
+                  << (anchors.size() >= max_anchors ? " (anchor cap reached)" : "") << '\n';
+    }
+    for (const auto& anchor : anchors) {
+        std::cout << "anchor block_data=0x" << std::hex << anchor.data_va << std::dec
+                  << " codec=" << anchor.codec->label << " entries=" << anchor.entries
+                  << (anchor.capped ? "+" : "") << " consumed=0x" << std::hex << anchor.consumed
+                  << std::dec << '\n';
+        if (!anchor.block0_indices.empty()) {
+            std::cout << "  block0 FName indices (block 0, so (0 << 16) | offset / 2):\n";
+            for (const auto& [name, index] : anchor.block0_indices) {
+                std::cout << "    " << name << " index=0x" << std::hex << index << std::dec << " ("
+                          << index << ")\n";
+            }
+        }
+    }
+    if (anchors.empty()) {
+        std::cout << "SUMMARY build=" << kBuildStamp << " anchors=0 validated_pools=0\n";
+        std::cout << "next: no block whose first entry decodes as \"" << kExpectedFirst << "\" with "
+                  << min_entries << "+ entries exists in the captured memory. Dump the bytes around a"
+                     " known name (dump-read on the block VA from the previous notes) to read the real"
+                     " entry header instead of assuming shift 6 or the stock layout.\n";
+        return;
+    }
+
+    std::size_t validated_pools = 0;
+    for (const auto& anchor : anchors) {
+        std::cout << "\n=== anchor block_data=0x" << std::hex << anchor.data_va << std::dec << " ===\n";
+        if (anchor.data_va > 0x40) {
+            PrintHexWindow("bytes_before_block", read(anchor.data_va - 0x40, 0x40));
+        }
+        std::vector<std::uint32_t> header_candidates;
+        header_candidates.assign(kProbeSizes.begin(), kProbeSizes.end());
+        const auto probes = ProbeBlockHeaders(
+            read, anchor.data_va, block_size, *anchor.codec, min_entries, header_candidates);
+        std::uint32_t header_size = 0;
+        for (const auto& probe : probes) {
+            std::cout << "  probe header=0x" << std::hex << probe.header_va << std::dec
+                      << " header_size=0x" << std::hex << probe.header_size << std::dec
+                      << " captured=" << probe.header_captured << " next=0x" << std::hex << probe.next
+                      << std::dec << " next_is_block=" << probe.next_is_block
+                      << " next_entries=" << probe.next_entries << '\n';
+            if (header_size == 0 && probe.next_is_block) {
+                header_size = probe.header_size;
+            }
+        }
+
+        NameBlockChain chain;
+        if (header_size != 0) {
+            chain = FollowNameBlocks(read, anchor.data_va, header_size, block_size, *anchor.codec,
+                min_entries, entry_cap, max_blocks);
+            std::cout << "  chain header_size=0x" << std::hex << chain.header_size << std::dec
+                      << " blocks=" << chain.blocks.size() << " entries=" << chain.total_entries
+                      << (chain.total_capped ? "+" : "") << " stop=\"" << chain.stop_reason << "\"\n";
+            for (std::size_t i = 0; i < chain.blocks.size() && i < 32; ++i) {
+                const auto& node = chain.blocks[i];
+                std::cout << "    block[" << i << "] data=0x" << std::hex << node.data_va << " header=0x"
+                          << node.header_va << " next=0x" << node.next << std::dec << " entries="
+                          << node.stats.entries << " consumed=0x" << std::hex << node.stats.consumed
+                          << std::dec << " first=\"" << node.stats.first_name << "\" last=\""
+                          << node.stats.last_name << "\"\n";
+            }
+            if (chain.blocks.size() > 32) {
+                std::cout << "    ... " << (chain.blocks.size() - 32) << " more blocks\n";
+            }
+        } else {
+            std::cout << "  no captured qword in front of the block points at another decodable block;"
+                         " the pool is not a plain FBlockInfo chain in this build\n";
+        }
+
+        // Second allocator shape: blocks laid out back to back instead of chained through headers.
+        std::uint64_t stride_entries = 0;
+        std::size_t stride_blocks = 0;
+        for (std::size_t index = 1; index < max_blocks; ++index) {
+            const auto step = static_cast<std::uint64_t>(block_size);
+            if (anchor.data_va > std::numeric_limits<std::uint64_t>::max() - index * step) {
+                break;
+            }
+            const auto data_va = anchor.data_va + index * step;
+            const auto block = read(data_va, block_size);
+            if (!block || block->size() < block_size) {
+                break;
+            }
+            const auto walk = DetectNameBlock(*block, kNameCodecCandidates, "", min_entries, entry_cap);
+            if (walk.codec == nullptr) {
+                break;
+            }
+            ++stride_blocks;
+            stride_entries += walk.entries.size();
+        }
+        std::cout << "  stride_blocks=" << stride_blocks << " stride_entries=" << stride_entries
+                  << " (further blocks at block_size intervals that still decode as name streams)\n";
+
+        // Every captured pointer to the block: an in-image hit is a GNames candidate with a stable RVA,
+        // a heap hit is only useful inside this dump.
+        std::vector<std::uint64_t> targets{anchor.data_va};
+        for (const auto size : kProbeSizes) {
+            if (anchor.data_va > size) {
+                targets.push_back(anchor.data_va - size);
+            }
+        }
+        for (const auto& node : chain.blocks) {
+            targets.push_back(node.header_va);
+            targets.push_back(node.data_va);
+        }
+        std::sort(targets.begin(), targets.end());
+        targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
+        const auto target_lo = targets.front();
+        const auto target_hi = targets.back();
+        std::size_t image_refs = 0;
+        std::size_t heap_refs = 0;
+        for (const auto& range : ranges) {
+            if (range.size < 8) {
+                continue;
+            }
+            const auto data = bytes.subspan(
+                static_cast<std::size_t>(range.file_offset), static_cast<std::size_t>(range.size));
+            for (std::size_t position = 0; position + 8 <= data.size(); position += 8) {
+                const auto value = U64(data.data() + position);
+                if (value < target_lo || value > target_hi) {
+                    continue;
+                }
+                if (!std::binary_search(targets.begin(), targets.end(), value)) {
+                    continue;
+                }
+                const auto va = range.va + position;
+                std::cout << "  referrer=0x" << std::hex << va << " -> 0x" << value << std::dec
+                          << (in_image(va) ? " [image]" : " [heap]");
+                if (in_image(va)) {
+                    std::cout << " RVA=0x" << std::hex << (va - image_base) << std::dec;
+                    ++image_refs;
+                } else {
+                    ++heap_refs;
+                }
+                std::cout << '\n';
+                if (image_refs + heap_refs >= referrer_cap) {
+                    break;
+                }
+            }
+            if (image_refs + heap_refs >= referrer_cap) {
+                break;
+            }
+        }
+        std::cout << "  referrers image=" << image_refs << " heap=" << heap_refs
+                  << (image_refs + heap_refs >= referrer_cap ? " (cap reached)" : "") << '\n';
+
+        const auto block_count = std::max<std::size_t>(chain.blocks.size(), stride_blocks + 1);
+        const auto names = chain.total_entries != 0 ? chain.total_entries : stride_entries + anchor.entries;
+        if (block_count > 1) {
+            ++validated_pools;
+            std::cout << "PREDICATE PASS blocks=" << block_count << " names=" << names
+                      << (chain.total_capped ? " (capped)" : "") << " pool_referrers_image=" << image_refs
+                      << " heap=" << heap_refs << '\n';
+            if (image_refs == 0) {
+                std::cout << "  no in-image pointer to the block: the pool is reached through heap memory."
+                             " Run dump-xrefs on the block VA and disassemble the function that loads it to"
+                             " recover the stable global RVA.\n";
+            }
+        } else {
+            std::cout << "PREDICATE FAIL: single block only, " << anchor.entries
+                      << " names decoded from the anchor. The chain walk found no second block, so the"
+                         " block-linking assumption is wrong for this build.\n";
+        }
+    }
+    std::cout << "\nSUMMARY build=" << kBuildStamp << " anchors=" << anchors.size()
+              << " validated_pools=" << validated_pools << " scanned_bytes=" << scanned_bytes
+              << " marker_hits=" << marker_hits << " region_probes=" << region_probes << '\n';
+    std::cout << "note: an in-image referrer gives an RVA that survives restarts, a heap referrer does"
+                 " not. Decoded names prove the pool layout only; no object header field is implied.\n";
 }
 
 } // namespace arc

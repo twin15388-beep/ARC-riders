@@ -7,6 +7,7 @@
 #include "Scanner.h"
 #include "Usmap.h"
 #include "ArcDecrypt.h"
+#include "Version.h"
 
 #include <windows.h>
 
@@ -35,7 +36,10 @@ void Usage() {
         << "arc_tool dump-strings <game.dmp> <text>  Find a string in captured memory\n"
         << "arc_tool dump-xrefs <game.dmp> <VA>      Find little-endian pointers to VA\n"
         << "arc_tool dump-rip-xrefs <game.dmp> <VA>  Find RIP-relative LEA references\n"
-        << "arc_tool dump-fname-pool <game.dmp> <base> <image_size>  Validate heap FNamePool\n"
+        << "arc_tool dump-fname-pool <game.dmp> <base> <image_size>  Superseded shape scan\n"
+        << "arc_tool dump-fname-blocks <game.dmp> <base> <image_size> [block0_VA] [block_size] [min_entries] [max_blocks]  Recover the FName pool from a decodable block\n"
+        << "arc_tool probe <pid>                     Report which process rights are granted\n"
+        << "arc_tool version                          Print the embedded build stamp\n"
         << "arc_tool dump-scan <game.dmp> <AOB>      Find an AOB pattern in captured memory\n"
         << "arc_tool dump-read <game.dmp> <VA> <size>  Hex-dump up to 4096 bytes\n"
         << "arc_tool dump-chain <game.dmp> <VA> [offset ...]  Read pointer, then pointer+offset steps\n"
@@ -167,6 +171,10 @@ int Inspect(const std::uint32_t pid, const std::filesystem::path& config_path) {
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "version") {
+            std::cout << "arc_tool build=" << arc::kBuildStamp << '\n';
+            return 0;
+        }
         if (argc == 3 && std::string_view(argv[1]) == "modules") {
             return Modules(ParsePid(argv[2]));
         }
@@ -202,6 +210,23 @@ int main(int argc, char** argv) {
         }
         if (argc == 5 && std::string_view(argv[1]) == "dump-fname-pool") {
             arc::PrintDumpFNamePool(argv[2], arc::ParseUnsigned(argv[3]), arc::ParseUnsigned(argv[4]));
+            return 0;
+        }
+        if (argc >= 5 && std::string_view(argv[1]) == "dump-fname-blocks") {
+            const auto anchor = argc >= 6 ? arc::ParseUnsigned(argv[5]) : 0;
+            const auto block_size = argc >= 7 ? arc::ParseUnsigned(argv[6]) : 0x20000;
+            const auto min_entries = argc >= 8 ? arc::ParseUnsigned(argv[7]) : 64;
+            const auto max_blocks = argc >= 9 ? arc::ParseUnsigned(argv[8]) : 4096;
+            if (block_size > UINT32_MAX || min_entries > UINT32_MAX || max_blocks > SIZE_MAX) {
+                throw std::invalid_argument("block_size/min_entries must fit uint32 and max_blocks size_t");
+            }
+            arc::PrintDumpFNameBlocks(argv[2], arc::ParseUnsigned(argv[3]), arc::ParseUnsigned(argv[4]),
+                anchor, static_cast<std::uint32_t>(block_size), static_cast<std::uint32_t>(min_entries),
+                static_cast<std::size_t>(max_blocks));
+            return 0;
+        }
+        if (argc == 3 && std::string_view(argv[1]) == "probe") {
+            arc::PrintProcessProbe(ParsePid(argv[2]));
             return 0;
         }
         if (argc == 4 && std::string_view(argv[1]) == "dump-rip-xrefs") {

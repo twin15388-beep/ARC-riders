@@ -1,13 +1,17 @@
 #include "Chain.h"
 #include "Config.h"
 #include "Pattern.h"
+#include "Names.h"
 #include "Usmap.h"
 #include "ArcDecrypt.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <array>
 #include <exception>
+#include <optional>
+#include <span>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -162,6 +166,186 @@ void TestUsmap() {
 }
 
 
+void PutU16At(std::vector<std::uint8_t>& bytes, const std::size_t offset, const std::uint16_t value) {
+    bytes[offset] = static_cast<std::uint8_t>(value);
+    bytes[offset + 1] = static_cast<std::uint8_t>(value >> 8);
+}
+
+void PutU32At(std::vector<std::uint8_t>& bytes, const std::size_t offset, const std::uint32_t value) {
+    for (std::size_t i = 0; i < 4; ++i) {
+        bytes[offset + i] = static_cast<std::uint8_t>(value >> (i * 8));
+    }
+}
+
+void PutU64At(std::vector<std::uint8_t>& bytes, const std::size_t offset, const std::uint64_t value) {
+    for (std::size_t i = 0; i < 8; ++i) {
+        bytes[offset + i] = static_cast<std::uint8_t>(value >> (i * 8));
+    }
+}
+
+// FName entry in the measured encoding: header (length << 6), characters, null, padded to an even offset.
+void PutNameEntry(std::vector<std::uint8_t>& bytes, std::string_view name) {
+    const auto start = bytes.size();
+    bytes.resize(start + 2);
+    PutU16At(bytes, start, static_cast<std::uint16_t>(name.size() << 6));
+    bytes.insert(bytes.end(), name.begin(), name.end());
+    bytes.push_back(0);
+    if (bytes.size() % 2 != 0) {
+        bytes.push_back(0);
+    }
+}
+
+std::vector<std::uint8_t> MakeNameBlock(const std::vector<std::string>& names, std::size_t block_size) {
+    std::vector<std::uint8_t> bytes;
+    for (const auto& name : names) {
+        PutNameEntry(bytes, name);
+    }
+    bytes.resize(block_size, 0);
+    return bytes;
+}
+
+// Reads return the longest contiguous run inside one synthetic captured region.
+arc::CapturedRead MakeMapReader(std::vector<std::uint8_t>& map, std::uint64_t map_base) {
+    return [&map, map_base](std::uint64_t va, std::uint64_t size)
+               -> std::optional<std::span<const std::uint8_t>> {
+        if (va < map_base || va - map_base >= map.size()) {
+            return std::nullopt;
+        }
+        const auto available = map_base + map.size() - va;
+        const auto length = std::min<std::uint64_t>(size, available);
+        return std::span<const std::uint8_t>(
+            map.data() + (va - map_base), static_cast<std::size_t>(length));
+    };
+}
+
+void TestNameEntries() {
+    const auto block = MakeNameBlock(
+        {"None", "ByteProperty", "World", "Actor", "PioneerPlayerCharacter"}, 0x20000);
+    const auto walk = arc::WalkNameBlock(block, arc::kNameCodecMeasured, 16);
+    Check(walk.entries.size() == 5, "measured codec entry count");
+    Check(walk.entries.front().text == "None", "first entry is None");
+    Check(walk.entries[4].text == "PioneerPlayerCharacter", "last entry text");
+    // 8 + 16 + 8 + 8 + 26: header, characters, terminator, even padding.
+    Check(walk.consumed == 66, "block bytes consumed");
+    Check(!walk.span_exhausted, "block span not exhausted");
+    const auto stats = arc::MeasureNameBlock(block, arc::kNameCodecMeasured, 8192);
+    Check(stats.entries == 5 && stats.last_name == "PioneerPlayerCharacter", "measured block summary");
+
+    std::vector<std::uint8_t> wide_bytes(0x100, 0);
+    PutU16At(wide_bytes, 0, static_cast<std::uint16_t>((5 << 6) | 1));
+    const char16_t wide[5] = {u'W', u'o', u'r', u'l', u'd'};
+    for (std::size_t i = 0; i < 5; ++i) {
+        PutU16At(wide_bytes, 2 + i * 2, static_cast<std::uint16_t>(wide[i]));
+    }
+    const auto wide_walk = arc::WalkNameBlock(wide_bytes, arc::kNameCodecMeasured, 8);
+    Check(wide_walk.entries.size() == 1 && wide_walk.entries[0].wide &&
+              wide_walk.entries[0].text == "World", "wide entry decodes");
+
+    std::vector<std::uint8_t> noise(0x400);
+    for (std::size_t i = 0; i < noise.size(); ++i) {
+        noise[i] = static_cast<std::uint8_t>(i * 7 + 3);
+    }
+    Check(arc::MeasureNameBlock(noise, arc::kNameCodecMeasured, 8192).entries < 8,
+        "random bytes decoded as a name stream");
+
+    std::vector<std::uint8_t> broken(0x40, 0);
+    PutU16At(broken, 0, static_cast<std::uint16_t>(4 << 6));
+    std::memcpy(broken.data() + 2, "NonXX", 5);  // no terminator after four characters
+    Check(arc::MeasureNameBlock(broken, arc::kNameCodecMeasured, 8).entries == 0,
+        "entry without a terminator accepted");
+    PutU16At(broken, 0, static_cast<std::uint16_t>(4 << 6));
+    std::memcpy(broken.data() + 2, "No\x01X", 4);  // control byte inside the name
+    Check(arc::MeasureNameBlock(broken, arc::kNameCodecMeasured, 8).entries == 0,
+        "control byte accepted as a name");
+
+    const auto best = arc::DetectNameBlock(block, arc::kNameCodecCandidates, "None", 2, 64);
+    Check(best.codec != nullptr && best.entries.size() == 5, "codec detection picked a codec");
+    Check(best.codec->label == arc::kNameCodecMeasured.label, "codec detection result");
+    Check(arc::DetectNameBlock(block, arc::kNameCodecCandidates, "Missing", 2, 64).codec == nullptr,
+        "wrong expected first name accepted");
+    Check(arc::DetectNameBlock(block, arc::kNameCodecCandidates, "None", 6, 64).codec == nullptr,
+        "min_entries gate ignored");
+}
+
+void TestNameBlockChain() {
+    constexpr std::uint64_t map_base = 0x1000000;
+    constexpr std::size_t block_size = 0x20000;
+    constexpr std::uint32_t header_size = 0x10;
+    std::vector<std::uint8_t> map(3 * block_size + 0x100, 0);
+    const auto block0 = MakeNameBlock({"None", "World", "Actor"}, block_size);
+    const auto block1 = MakeNameBlock({"Pawn", "PlayerController"}, block_size);
+    const auto block2 = MakeNameBlock({"UWorld", "Level"}, block_size);
+    std::memcpy(map.data() + 0x100, block0.data(), block_size);
+    std::memcpy(map.data() + 0x100 + block_size, block1.data(), block_size);
+    std::memcpy(map.data() + 0x100 + 2 * block_size, block2.data(), block_size);
+    const auto data0 = map_base + 0x100;
+    const auto data1 = data0 + block_size;
+    const auto data2 = data1 + block_size;
+    PutU64At(map, 0x100 - header_size, data1 - header_size);
+    PutU32At(map, 0x100 - header_size + 8, 0);
+    PutU32At(map, 0x100 - header_size + 0xC, 0x18);
+    PutU64At(map, 0x100 + block_size - header_size, data2 - header_size);
+    PutU64At(map, 0x100 + 2 * block_size - header_size, 0);
+
+    auto read = MakeMapReader(map, map_base);
+    const std::uint32_t candidates[] = {header_size, 0x18, 0x20};
+    const auto probes = arc::ProbeBlockHeaders(
+        read, data0, block_size, arc::kNameCodecMeasured, 2, candidates);
+    Check(probes.size() == 3, "probe count");
+    Check(probes[0].header_captured && probes[0].next_is_block && probes[0].next_entries == 2,
+        "correct header size identified");
+    Check(!probes[1].next_is_block && !probes[2].next_is_block, "wrong header sizes rejected");
+    Check(probes[0].window.size() == header_size, "header window bytes captured");
+
+    const auto chain = arc::FollowNameBlocks(
+        read, data0, header_size, block_size, arc::kNameCodecMeasured, 2, 8192, 16);
+    Check(chain.blocks.size() == 3, "chain block count");
+    Check(chain.total_entries == 7 && !chain.total_capped, "chain entry total");
+    Check(chain.blocks[0].stats.consumed == 0x18, "block consumed bytes");
+    Check(chain.blocks[2].next == 0 && chain.stop_reason == "end of chain: null next pointer",
+        "chain stop reason");
+
+    const auto missing = [](std::uint64_t, std::uint64_t) -> std::optional<std::span<const std::uint8_t>> {
+        return std::nullopt;
+    };
+    const std::uint32_t one_candidate[] = {0x10};
+    Check(!arc::ProbeBlockHeaders(missing, 0x2000, 0x200, arc::kNameCodecMeasured, 2, one_candidate)
+               .front()
+               .header_captured,
+        "uncaptured header reported as captured");
+    const auto absent = arc::FollowNameBlocks(
+        missing, 0x2000, 0x10, 0x20000, arc::kNameCodecMeasured, 2, 64, 8);
+    Check(absent.blocks.size() == 1 && absent.stop_reason == "block data is not captured",
+        "uncaptured block stop reason");
+    std::vector<std::uint8_t> partial(0x10, 0);
+    const auto partial_block = MakeNameBlock({"None", "World"}, 0xF0);
+    partial.insert(partial.end(), partial_block.begin(), partial_block.end());
+    auto partial_read = MakeMapReader(partial, 0);
+    const auto short_chain = arc::FollowNameBlocks(
+        partial_read, 0, 0x10, 0x100, arc::kNameCodecMeasured, 4, 64, 8);
+    Check(short_chain.blocks.empty() && short_chain.stop_reason == "invalid block data VA or header size",
+        "anchor VA below the header size not rejected");
+    const auto last_partial = arc::FollowNameBlocks(
+        partial_read, 0x10, 0x10, 0x100, arc::kNameCodecMeasured, 4, 64, 8);
+    Check(last_partial.blocks.size() == 1 &&
+        last_partial.stop_reason == "short block: fewer entries than min_entries, typically the partially filled last block",
+        "partially filled last block reason");
+
+    std::vector<std::uint8_t> loop(0x220, 0);
+    const auto self_block = MakeNameBlock({"None", "World"}, 0x100);
+    std::memcpy(loop.data() + 0x10, self_block.data(), 0x100);
+    PutU64At(loop, 0, 0x1000);  // Next points at its own header
+    auto loop_read = MakeMapReader(loop, 0x1000);
+    const auto cyclic = arc::FollowNameBlocks(
+        loop_read, 0x1010, 0x10, 0x20000, arc::kNameCodecMeasured, 2, 64, 8);
+    Check(cyclic.blocks.size() == 1 && cyclic.stop_reason == "cycle in the block chain",
+        "cycle not detected");
+    const auto underflow = arc::FollowNameBlocks(
+        loop_read, 0x8, 0x10, 0x20000, arc::kNameCodecMeasured, 2, 64, 8);
+    Check(underflow.blocks.empty() && !underflow.stop_reason.empty(), "underflow guard missing");
+}
+
+
 void TestViewportDecrypt() {
     std::array<std::uint8_t, 0x100> bank{};
     const std::uint64_t lo = 0xF7149774B727E060ULL, hi = 0x642BFE20256AF201ULL;
@@ -185,6 +369,8 @@ int main() {
         TestNumbersAndChains();
         TestConfig();
         TestUsmap();
+        TestNameEntries();
+        TestNameBlockChain();
         TestViewportDecrypt();
         std::cout << "All core checks passed\n";
         return 0;

@@ -46,6 +46,45 @@ Unreal core classes in this mapping use names such as `World`, `Actor`, `Object`
 
 ## Dump inspection
 
+### FName pool recovery from a block anchor
+
+`dump-fname-blocks` starts from data that can be read instead of from a guessed global address: it
+locates the pool block whose first entry decodes as `None`, identifies the block header by checking
+which candidate offset makes the following pointer land on another decodable block, walks the block
+chain, and then lists every captured pointer to those blocks. An in-image referrer is a `GNames`
+candidate with a stable RVA; a heap referrer is only valid inside the dump. It also prints the computed
+pool indices (`(block << 16) | entry_offset / 2`) for the engine names the ESP chain needs.
+
+```powershell
+.\arc_tool.exe dump-fname-blocks $d 0x140000000 0x139F9000
+.\arc_tool.exe dump-fname-blocks $d 0x140000000 0x139F9000 0xA6A00000   # explicit block anchor
+```
+
+Discovery assumes a block begins where its first entry begins, and that a `FBlockInfo`-style header of
+`0x8..0x30` bytes precedes the entry data. No 128 KB alignment of the block is assumed, and no
+contiguous run of "named" blocks is required. `dump-fname-pool` keeps the older shape predicate
+(aligned block base derived by masking the entry address, plus a run of eight blocks that each contain
+one of ten names) and is superseded: that conjunction cannot pass on a UE5 block layout, so
+`validated_pools=0` from it is not evidence about the game.
+
+Entry-header encoding is chosen by measurement. `Names.h` carries two candidate codecs; the report
+names the one that actually decoded the block, so the encoding is a result rather than an assumption.
+
+### Access probe for a live process
+
+A handle can be granted with `PROCESS_VM_READ` silently stripped, so the decisive question is whether a
+read succeeds, not whether `OpenProcess` returned. `probe` prints the per-rights result, the token's
+elevation and `SeDebugPrivilege` state, the module list recovered through `NtQueryInformationProcess`
+and the PEB (no Toolhelp), the MZ check at the image base, and reads of up to five private committed
+regions.
+
+```powershell
+.\arc_tool.exe probe <pid>
+```
+
+`arc_tool version` prints the embedded build stamp, and every FName report repeats it, because running
+a stale executable otherwise looks like a negative result about the game.
+
 ```powershell
 $a = "$env:USERPROFILE\Downloads\arc_tool.exe"
 $d = "$env:USERPROFILE\AppData\Local\Temp\PioneerGame.DMP"
@@ -72,7 +111,7 @@ $d = "$env:USERPROFILE\AppData\Local\Temp\PioneerGame.DMP"
 
 - Build-verified: Windows AMD64 PE cross-compilation with LLVM/MinGW, warnings as errors.
 - Isolated checks: portable core tests plus ASan/UBSan; the supplied 5.4 MB `.usmap` parses completely.
-- Not established: exact global `FNamePool`, `GUObjectArray`, `GWorld`, decryption routines, byte offsets, generated SDK, ESP, or any in-game behavior.
+- Not established: exact global `FNamePool`, `GUObjectArray`, `GWorld`, decryption routines, byte offsets, generated SDK, ESP, or any in-game behavior. `dump-fname-blocks` was verified end to end against a synthetic MDMP (three chained blocks, unaligned block data, in-image referrer) built for that purpose; it has not been run against a game dump yet.
 - Public candidate `base+0x109BB1C0` is rejected for the supplied dump because its first pointer is zero. Other public candidates remain unvalidated until their pointed data and decryption are checked.
 
 ## Build-specific viewport candidate

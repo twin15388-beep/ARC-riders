@@ -42,6 +42,10 @@ private:
     std::uint32_t pid_{};
 };
 
+// Reports exactly which access rights the target grants, the current token's debug privilege state,
+// and whether the module list is reachable through the PEB when Toolhelp enumeration fails.
+void PrintProcessProbe(std::uint32_t pid);
+
 [[nodiscard]] std::string WideToUtf8(std::wstring_view value);
 [[nodiscard]] std::wstring Utf8ToWide(std::string_view value);
 [[nodiscard]] std::uint32_t ReadPeTimestamp(const Process& process, const ModuleInfo& module);

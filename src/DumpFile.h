@@ -47,6 +47,16 @@ void PrintDumpFNamePool(
     const std::filesystem::path& path,
     std::uint64_t image_base,
     std::uint64_t image_size);
+// Anchor-driven FName pool recovery: finds the block that starts with a known first name, follows the
+// block chain, and reports every captured pointer to that block (in-image hits are GNames RVAs).
+void PrintDumpFNameBlocks(
+    const std::filesystem::path& path,
+    std::uint64_t image_base,
+    std::uint64_t image_size,
+    std::uint64_t anchor_data_va,
+    std::uint32_t block_size,
+    std::uint32_t min_entries,
+    std::size_t max_blocks);
 
 } // namespace arc
 

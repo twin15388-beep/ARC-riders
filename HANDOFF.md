@@ -156,3 +156,90 @@ Next command: `dump-read <DMP> 0x1F53F3D00 0x600`. Compare it with captured `0x1
 ## Focused ESP handoff
 
 Current user request: consolidate only information useful to another engineer/AI for implementing ESP, Aim, Trigger, Minimap and ImGui menu UI. See `ESP_HANDOFF_RU.md`. It contains exact measured chain/vtables, dump/USMAP identities, rejected RTTI/GObjects/Levels/viewport paths, the pending FNamePool predicate and command, constructor lead `0x144C364EB`, per-feature missing data and the ordered recovery plan. No ESP/Aim/Trigger/Minimap runtime functionality exists or was observed in-game. Latest FNamePool executable SHA-256 is `9cbf241d21024442e16ee37e5150327f054d19da53e829d1072a47d83fc96d2c`; user accidentally ran an older executable, so the new FNamePool scan remains pending.
+
+## Route review, FName anchor tool, access probe (2026-11-13)
+
+User asked whether the ESP route is right, and to change it if not. Findings, measured from this repo's
+own code and from the Dropbox account:
+
+- `dump-fname-pool` cannot pass by construction: it requires the block base to equal `entry & ~0x1FFFF`
+  (128 KB-aligned block data), a contiguous run of eight `Chunks` entries that each point at a block
+  containing one of ten hard-coded names, and the `Chunks` pointer itself to live outside the image.
+  UE5 FNamePool blocks are separate allocations chained through `FBlockInfo::Next`, and engine-core
+  names sit in the first blocks, so that conjunction fails even with a perfectly valid pool. The pending
+  run was cancelled before it cost the user time; the command is kept and marked superseded.
+- Replaced by `dump-fname-blocks`: anchor on the block whose first entry decodes as `None`, measure the
+  block-header size by requiring `Next` to land on another decodable block, walk the chain (plus a
+  contiguous-stride fallback), print `bytes_before_block` as raw hex, print `(block << 16) | offset / 2`
+  pool indices for the names the ESP chain needs, then list every captured pointer to those blocks and
+  split it into `[image] RVA=...` (a `GNames` candidate that survives restarts) and `[heap]`.
+  New portable code in `src/Names.h`, `src/Names.cpp`; entry-header codec is chosen by measurement from
+  two candidates, not assumed.
+- Added `arc_tool probe <pid>` (`src/Process.cpp`): per-right `OpenProcess` results, token elevation and
+  `SeDebugPrivilege`, module list recovered through `NtQueryInformationProcess` + PEB without Toolhelp,
+  MZ check at `PEB.ImageBaseAddress`, and reads of up to five private committed regions. This settles
+  the external-vs-internal question with a measurement, because `OpenProcess` can return a handle with
+  `PROCESS_VM_READ` stripped by a protection callback.
+- Added `arc_tool version` plus a build stamp (`src/Version.h`, `-DARC_BUILD_STAMP`) printed in every
+  FName report, so running a stale executable cannot again be read as a negative result about the game.
+- Dropbox holds `/Dumper7-ARC-Raiders.zip` (1,504,996 bytes, rev `66015caf1db934b309220`), never
+  mentioned in earlier handoffs. If it is a Dumper-7 SDK for `CL-1450810`, it covers GNames/GObjects/
+  UWorld RVAs and field layouts directly and the whole section-6 recovery becomes a validation task.
+  It cannot be opened from this sandbox: egress to `*.dl.dropboxusercontent.com` failed with
+  `SSL_ERROR_SYSCALL` (verified), and only text files reach the workspace through the connector
+  (`/home/user/ARC-riders/dropbox/`).
+- The older `/ARC-riders/README-RUN.md` (2026-11-11, not part of this repo) describes an external
+  D3D11 overlay tool with a runtime session resolver: scan readable private memory for a GameInstance,
+  accept it only when `LocalPlayers -> PlayerController -> Pawn -> RootComponent -> RelativeLocation`
+  and an independent `ControlRotation` check agree. Its offsets come from an SDK dump of 2025-11-04
+  (pre-1.0), so they are candidates for stale values, not evidence. The design idea worth keeping:
+  chain-consistency validation needs no class names, so it does not depend on winning `GNames`.
+
+## Build and checks for this step
+
+Portable core checks (adds `TestNameEntries`, `TestNameBlockChain`):
+
+```sh
+g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -Isrc \
+  tests/CoreTests.cpp src/Pattern.cpp src/Config.cpp src/Chain.cpp src/Usmap.cpp src/ArcDecrypt.cpp src/Names.cpp \
+  -o /tmp/arc-check/arc_core_tests && /tmp/arc-check/arc_core_tests
+```
+
+Exit 0, `All core checks passed`; same with `-fsanitize=address,undefined -fno-omit-frame-pointer`, exit 0.
+
+Windows AMD64 build:
+
+```sh
+PYTHONPATH=/tmp/arc-check/zig-package python3 -m ziglang c++ -target x86_64-windows-gnu -std=c++20 -O2 -static \
+  -Wall -Wextra -Wpedantic -Werror -DUNICODE -D_UNICODE '-DARC_BUILD_STAMP="2026-11-13-fname-blocks-probe"' \
+  -Isrc src/Main.cpp src/DumpFile.cpp src/PeFile.cpp src/Process.cpp src/Scanner.cpp src/Pattern.cpp \
+  src/Config.cpp src/Chain.cpp src/Usmap.cpp src/ArcDecrypt.cpp src/Names.cpp -ladvapi32 -o out/arc_tool.exe
+```
+
+Exit 0. Size `1,190,912`, SHA-256 `3a7892ba226b7cb5d79e6eeba5e255fc0971425335519d39ab7a99421b23174e`,
+MZ/PE/AMD64/PE32+ validated. `Process.cpp` and `DumpFile.cpp` compile only under `_WIN32`, so zig is the
+only compiler that has seen them in this session; MSVC has not.
+
+End-to-end check of the new dump command without the game: the real `PrintDumpFNameBlocks` was compiled
+for Linux through a shim (`arc::MappedFile` over mmap, `arc::WideToUtf8`) by copying `src/*.cpp` plus two
+substitute headers and adding `-D_WIN32`, then run against a synthetic MDMP with a Memory64List stream of
+two ranges, three FName blocks of `0x20000` with `0x10` headers, block data deliberately NOT 128 KB
+aligned, and an in-image qword pointing at block 0's header. Result: `anchors=1`, header probe accepted
+`0x10` and rejected `0x8`/`0x18`/`0x20`/`0x28`/`0x30`, `chain blocks=3 entries=210
+stop="end of chain: null next pointer"`, `referrer=0x140000100 -> 0x200000f0 [image] RVA=0x100`,
+`PREDICATE PASS blocks=3 names=210 pool_referrers_image=2 heap=3`. Explicit-anchor mode, an over-strict
+`min_entries`, an uncaptured anchor VA and a bad `block_size` all behaved as intended (the last two with
+`error:` and exit 1). Recipe to reproduce: copy `src/*.h src/*.cpp` to a scratch dir, replace `PeFile.h`
+with a portable `MappedFile` declaration and `Process.h` with a `WideToUtf8` declaration, compile
+`probe_main.cpp shim.cpp DumpFile.cpp Names.cpp Pattern.cpp Chain.cpp` with `-D_WIN32`.
+
+Not run against a game dump, not run against a live process, nothing observed in game. ESP, Aim,
+Trigger, Minimap and menu remain unimplemented.
+
+## Shortest next verification step
+
+1. `arc_tool version` then `arc_tool dump-fname-blocks "<PioneerGame (3).DMP>" 0x140000000 0x139F9000`
+   and `arc_tool probe <pid>` in a live match.
+2. Unzip `Dumper7-ARC-Raiders.zip` into Dropbox so its `.hpp`/`.txt` files can be read through the
+   connector; if it is a `CL-1450810` dump, validate its `GNames`/`GObjects`/`UWorld` RVAs against the
+   dump instead of recovering them.

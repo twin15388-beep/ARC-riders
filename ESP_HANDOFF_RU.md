@@ -12,7 +12,7 @@
 
 Сейчас **ни одна из этих runtime-функций не реализована и не проверена**. Нет actor list, координат, camera, team/health или world-to-screen.
 
-Предпочтительная архитектура после получения offsets: external reader + transparent ImGui overlay. Internal DLL потребуется только для hooks/direct engine calls. Стандартная usermode инъекция на текущей системе не сработала: `VirtualAllocEx` error `5` до `LoadLibraryW`.
+Предпочтительная архитектура после получения offsets: external reader + transparent ImGui overlay. Internal DLL потребуется только для hooks/direct engine calls. Стандартная usermode инъекция на текущей системе не сработала: `VirtualAllocEx` error `5` до `LoadLibraryW`. Архитектура пока НЕ решена: `OpenProcess`/чтение живого процесса отдельно не проверялись, старый `README-RUN.md` показывает, что решает именно `rights: ReadProcessMemory(private regions) N of 5`, а не код `OpenProcess`. Это измеряется командой `arc_tool probe <pid>` (шаг 0–1 раздела 10).
 
 ## 2. Точная идентичность build
 
@@ -65,6 +65,35 @@ Ext:     CEXT / PPTH / ENVP
 ```
 
 USMAP parser проверен. **Schema/property indices — ordinals, не runtime byte offsets.** Не использовать их как offsets для ESP.
+
+### Не разобранные артефакты в Dropbox (найдены 2026-11-13)
+
+```text
+/Dumper7-ARC-Raiders.zip        1,504,996 bytes  rev 66015caf1db934b309220
+/1450810_[unknowncheats.me]_.zip 1,488,164 bytes  rev 66016a43183064b309220
+/PioneerGame.exe                322,041,712 bytes  rev 66006382facb84b309220
+/ARC-riders/README-RUN.md        15,149 bytes  (старый тул, см. ниже)
+/ARC-riders/config.json             591 bytes
+/ARC-riders/arc_riders_tool.exe 1,513,472 bytes  sha256 9df28ac9243130ea514fc22127a28e9bd0321806ea96a636b18357227e124623
+/ARC-riders/ARC-riders-0.1-nondma.zip 651,154 bytes
+```
+
+`Dumper7-ARC-Raiders.zip` в handoff ранее не фигурировал. Если это вывод Dumper-7 по текущему CL, он
+закрывает и `GNames`/`GObjects`/`UWorld` RVA, и раскладку полей, то есть обходит весь раздел 6 — но
+содержимое надо валидировать на `CL-1450810`, а не принимать как есть. Из песочницы zip не открыть:
+исходящая сеть разрешена только для github/npm/pypi, `curl` на
+`*.dl.dropboxusercontent.com` упал с `SSL_ERROR_SYSCALL` (проверено 2026-11-13). Текстовые файлы
+Dropbox-коннектор отдаёт в `/home/user/ARC-riders/dropbox/`, поэтому распакованный `Offsets.hpp` или
+`Dump.hpp` можно читать оттуда.
+
+Старый `ARC-riders-0.1-nondma` (2026-11-11) — внешний читалка-оверлей на D3D11 с уже написанным
+порядком диагностики: аттач, матрица прав (`rights: ReadProcessMemory(private regions) N of 5`),
+получение базы образа из PEB в обход Toolhelp, и поиск сессии F8 сканированием читаемой приватной
+памяти с валидацией цепочки `GameInstance → LocalPlayers → PlayerController → Pawn → RootComponent →
+RelativeLocation` независимой проверкой `ControlRotation`. Оффсеты там из «SDK dump 2025-11-04
+(pre-1.0)», то есть для 2.03.x потенциально устаревшие; ESP в том туле упирался ровно в
+`UWorld::PersistentLevel` через зашифрованный GWorld. Идея «валидировать цепочку согласованностью двух
+независимых векторов, а не именем класса» для нашего маршрута интересна: она не требует `GNames` вообще.
 
 ### Репозиторий
 
@@ -149,54 +178,54 @@ Object + 0x18 = 0
 - health/team/bones;
 - GameViewportClient.
 
-## 6. Активный FNamePool recovery — первый следующий шаг
+## 6. FNamePool recovery — актуальный шаг (2026-11-13)
 
-Добавлена команда:
+`dump-fname-pool` с маршрута снят: его предикат не мог дать `PREDICATE PASS`. Он требовал одновременно
+(а) `block = entry & ~0x1FFFF`, то есть блок, выровненный по 0x20000; (б) непрерывный прогон минимум из
+8 указателей, каждый из которых ведёт в блок, содержащий одно из 10 имён; (в) чтобы указатель на
+`Chunks[]` лежал в heap, а не в образе. В UE5 блоки — отдельные аллокации, связанные через
+`FBlockInfo::Next`, а имена ядра движка сосредоточены в первых блоках, поэтому такого прогона не
+существует даже при полностью рабочем пуле. `validated_pools=0` из этого скана — не факт про игру.
+
+Новая команда:
 
 ```text
-dump-fname-pool <DMP> <ImageBase> <ImageSize>
+dump-fname-blocks <DMP> <ImageBase> <ImageSize> [block0_VA] [block_size] [min_entries] [max_blocks]
 ```
 
-Она сканирует 10 известных USMAP names:
+- стартует от строки `None` и принимает блок только если поток записей декодируется плотно
+  (`min_entries`, по умолчанию 64); выравнивание блока не предполагается;
+- размер заголовка блока не предполагается: из кандидатов `0x8..0x30` берётся тот, у которого `Next`
+  ведёт в ещё один декодируемый блок, и он же печатается в отчёте;
+- затем обходится вся цепочка блоков (это и есть имена), отдельно пробуется форма «блоки идут подряд
+  через `block_size`» — `stride_blocks`;
+- печатается `bytes_before_block` — 0x40 raw-байт перед блоком, чтобы макет заголовка читался глазами,
+  а не выводился из догадки;
+- печатаются pool-индексы нужных ESP имён: `(block << 16) | entry_offset / 2`;
+- в конце — все указатели дампа на эти блоки: `[image] RVA=...` это кандидат `GNames`, стабильный между
+  запусками, `[heap]` годится только внутри этого дампа.
 
-```text
-World
-Actor
-Pawn
-GameInstance
-LocalPlayer
-PlayerController
-PlayerCameraManager
-PersistentLevel
-RootComponent
-/Script/Engine
-```
-
-Predicate приёма pool:
-
-1. ANSI FName header: length shift `6`, string offset `2`, wide bit снят.
-2. Block base: `entry & ~0x1FFFF`.
-3. Полный `0x20000` block присутствует в dump.
-4. `Chunks[]` находится в heap вне image.
-5. Минимум 8 валидных block pointers.
-6. Pool reference находится в heap вне image.
-7. Повторный decode по `(blockIndex << 16) | (entryOffset / 2)` точно совпадает с USMAP name.
-
-Команда:
+Кодировка заголовка записи тоже измеряется: в `Names.h` две кандидаты —
+`measured_shift6_wide0_str2` (измерено на блоке `0xA6A00000` dump `(2)`) и `alt_len_bits_0_9_wide10`, и
+отчёт пишет, какая из них реально декодировала блок.
 
 ```powershell
-.\arc_tool.exe dump-fname-pool "C:\Users\Malin\AppData\Local\Temp\PioneerGame (3).DMP" 0x140000000 0x139F9000
+.\arc_tool.exe version    # жду build=2026-11-13-fname-blocks-probe
+.\arc_tool.exe dump-fname-blocks "C:\Users\Malin\AppData\Local\Temp\PioneerGame (3).DMP" 0x140000000 0x139F9000
 ```
 
-**Важно:** пользователь случайно запустил старую EXE, поэтому этот scan ещё не выполнен. Нужен SHA-256:
+Проверено на синтетическом MDMP (три блока, данные НЕ выровнены по 0x20000, указатель на заголовок
+нулевого блока внутри образа): якорь найден, заголовок `0x10` определён probing-ом, цепочка
+`blocks=3 names=210`, referrer `[image] RVA=0x100`, `PREDICATE PASS`. На реальном дампе команда ещё не
+запускалась.
 
-```text
-9cbf241d21024442e16ee37e5150327f054d19da53e829d1072a47d83fc96d2c
-```
-
-Ожидаемый отчёт содержит `scanned_bytes`, `raw_hits`, `filtered`, `rejected_runs`, `chunk_candidates`, `validated_pools`. Принимать только `PREDICATE PASS`; при `validated_pools=0` результат не принят.
-
-Ранее найден plaintext FName block `0xA6A00000` в dump `(2)`, но глобальный pool не был валидирован. Не переносить этот heap VA в dump `(3)`.
+Добавлен `probe <pid>` — доступ к живому процессу как измеряемый факт: исход по одному `OpenProcess` на
+каждое право, состояние токена (elevation, `SeDebugPrivilege`), список модулей через
+`NtQueryInformationProcess` + PEB без Toolhelp, проверка `MZ` в `PEB.ImageBaseAddress` и до пяти чтений
+приватных committed-областей. Интерпретация — как в старом `README-RUN.md` в Dropbox: `OpenProcess`
+может вернуть хэндл с уже срезанным `PROCESS_VM_READ` (callback защиты), поэтому решает попытка чтения,
+а не успешный `OpenProcess`. Относительный external-vs-internal вывод `probe` ещё не давал: он не
+запускался на live-процессе.
 
 ## 7. Constructor lead, если FNamePool predicate не пройден
 
@@ -305,14 +334,26 @@ ImGui menu можно писать независимо, но оно не дас
 
 ## 10. Рекомендуемый порядок продолжения
 
-1. Запустить актуальный `dump-fname-pool`, проверить SHA-256 EXE, получить полный счётчик отчёта.
-2. При `PREDICATE PASS`: реализовать FName reader, затем class resolution и проверить четыре vtables/объекта.
-3. При `validated_pools=0`: дизассемблировать function около `0x144C364EB`, восстановить constructor stores и protected UObject header; не возвращаться к generic scans.
-4. Подтвердить Object 4 как UWorld через class name либо однозначные object relationships.
-5. Найти PersistentLevel/Actors структурно и проверить массив по vtables/back-references, не только по `(ptr,count,max)` shape.
-6. Восстановить RootComponent и position на нескольких actors; проверить движение/согласованность между dumps.
-7. Восстановить camera из Object 1/Object 2 или их camera manager; сделать и протестировать world-to-screen отдельно.
-8. Только затем overlay ESP и Minimap, после них Aim/Trigger и menu wiring.
+0. Если в `Dumper7-ARC-Raiders.zip` лежит SDK по `CL-1450810` — распаковать его в Dropbox и считать
+   `Offsets.hpp`/`Dump.hpp`: это быстрее закрывает `GNames`/`GObjects`/`UWorld` и раскладку полей, чем
+   восстановление по дампу. Тогда шаг 1–2 превращаются в валидацию готовых RVA на дампе.
+1. `arc_tool probe <pid>` в живом матче — решить external vs internal не догадкой: если
+   `private_region_reads` даёт `5 of 5`, внешний читатель живой; если `0 of 5`, external-маршрут закрыт
+   и overlay имеет смысл только внутри процесса.
+2. `dump-fname-blocks` по dump `(3)` (сначала `version`, хеш EXE выше). При `PREDICATE PASS`
+   с `pool_referrers_image>0` имеем измеренный RVA `GNames` и рабочий FName reader.
+3. Реализовать FName reader поверх найденного пула, затем class resolution и проверить четыре vtables и
+   объекта из раздела 4 по имени класса.
+4. При `anchors=0`: не возвращаться к generic scans — дизассемблировать функцию около `0x144C364EB` и
+   восстановлять protected UObject header (шаги 7 раздела 7 остаются в силе).
+5. Подтвердить Object 4 как UWorld через class name либо однозначные object relationships.
+6. Найти PersistentLevel/Actors структурно и проверить массив по vtables/back-references, не только по
+   `(ptr,count,max)` shape.
+7. Восстановить RootComponent и position на нескольких actors; проверить движение/согласованность между
+   dumps `(2)` и `(3)`.
+8. Восстановить camera из Object 1/Object 2 или их camera manager; world-to-screen написать и
+   протестировать отдельно от чтения игры.
+9. Только затем overlay ESP и Minimap, после них Aim/Trigger и menu wiring.
 
 ## 11. Актуальный arc_tool
 
@@ -320,11 +361,12 @@ ImGui menu можно писать независимо, но оно не дас
 
 https://www.dropbox.com/scl/fi/37w7un59wy4kc3slpw5xs/arc_tool.exe?rlkey=oes20rpmsq1wm7zkvcljap17e&dl=0
 
-Актуальная для FNamePool версия:
+Актуальная версия (2026-11-13, `dump-fname-blocks` + `probe` + `version`):
 
 ```text
-Size:    1072128 bytes
-SHA-256: 9cbf241d21024442e16ee37e5150327f054d19da53e829d1072a47d83fc96d2c
+Size:    1190912 bytes
+SHA-256: 3a7892ba226b7cb5d79e6eeba5e255fc0971425335519d39ab7a99421b23174e
+build stamp: 2026-11-13-fname-blocks-probe
 ```
 
 Build выполнен Zig `x86_64-windows-gnu`, C++20, static, strict `-Werror`, exit code `0`. Portable core tests прошли. FNamePool scan на реальном dump ещё не запускался из-за запуска пользователем старого EXE. Ничего не проверено в live game.
