@@ -4,3 +4,6 @@
 *.user
 *.suo
 .vs/
+
+# Linux verification harness output (tools/offline-port) - compiled here, never shipped
+tools/offline-port/build/

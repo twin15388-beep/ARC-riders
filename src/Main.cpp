@@ -45,6 +45,8 @@ void Usage() {
         << "arc_tool version                          Print the embedded build stamp\n"
         << "arc_tool dump-scan <game.dmp> <AOB>      Find an AOB pattern in captured memory\n"
         << "arc_tool dump-read <game.dmp> <VA> <size>  Hex-dump up to 4096 bytes\n"
+        << "arc_tool esp-actors <game.dmp> <base> <size> [min_num] [out.ini]  Sweep captured memory for\n"
+        << "                                         the actor array and derive positions from it\n"
         << "arc_tool esp-chain <game.dmp> <base> <size> [global_rva] [\"chain\"] [out.ini]  Derive\n"
         << "                                         the ESP object graph from a dump by structural\n"
         << "                                         tests (defaults: 0x108FEEC0, \"0xA0,0x250,0x160\")\n"
@@ -262,6 +264,33 @@ int main(int argc, char** argv) {
             arc::PrintDumpFNameBlocks(argv[2], arc::ParseUnsigned(argv[3]), arc::ParseUnsigned(argv[4]),
                 anchor, static_cast<std::uint32_t>(block_size), static_cast<std::uint32_t>(min_entries),
                 static_cast<std::size_t>(max_blocks), marker_list, names_out);
+            return 0;
+        }
+        if (argc >= 4 && std::string_view(argv[1]) == "esp-actors") {
+            // esp-actors <game.dmp> <base> <image_size> [min_num] [out.ini] - same shape classification,
+            // so the threshold may be left out and the output path given as a bare last argument.
+            std::uint64_t min_num = 64;
+            bool have_min = false;
+            std::filesystem::path out_path;
+            for (int i = 5; i < argc; ++i) {
+                const std::string_view arg{argv[i]};
+                if (arg.size() > 4 && (arg.compare(arg.size() - 4, 4, ".ini") == 0 ||
+                        arg.compare(arg.size() - 4, 4, ".txt") == 0)) {
+                    out_path = arg;
+                    continue;
+                }
+                if (!have_min) {
+                    try {
+                        min_num = arc::ParseUnsigned(arg);
+                        have_min = true;
+                        continue;
+                    } catch (const std::exception&) {
+                    }
+                }
+                throw std::invalid_argument("esp-actors takes [min_num] then [out.ini]");
+            }
+            arc::PrintDumpEspActors(argv[2], arc::ParseUnsigned(argv[3]), arc::ParseUnsigned(argv[4]),
+                static_cast<std::uint32_t>(min_num), out_path);
             return 0;
         }
         if (argc >= 4 && std::string_view(argv[1]) == "esp-chain") {

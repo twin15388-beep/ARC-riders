@@ -439,14 +439,15 @@ ImGui menu можно писать независимо, но оно не дас
 
 https://www.dropbox.com/scl/fi/37w7un59wy4kc3slpw5xs/arc_tool.exe?rlkey=oes20rpmsq1wm7zkvcljap17e&dl=0
 
-Актуальная версия (2026-11-13, режим `esp-chain` — вывод offset'ов ESP из дампа структурными
+Актуальная версия (2026-11-13, `esp-chain` + `esp-actors` — вывод offset'ов ESP из дампа структурными
 предикатами; внутри также dense-таблицы в `dump-fname-blocks`, обратная цепочка в
 `dump-fname-layout`, `probe`/`probe-write`):
 
 ```text
-Size:    1364480 bytes
-SHA-256: e7d7097d5a451158d84aff92d4c7a035802d36a2d35d033bbecd272ae8d35ca0
-build stamp: 2026-11-13-esp1  (Dropbox rev 6602ae139d1644b309220)
+Size:    1401344 bytes
+SHA-256: e29d482e316fb8d6f55dd99bc7ed81a3d75e8e29ec9ddc27f26f9ec01f61651c
+build stamp: 2026-11-13-esp2  (Dropbox rev 6602d1c4962e04b309220)
+предыдущая: 1364480 / e7d7097d5a451158d84aff92d4c7a035802d36a2d35d033bbecd272ae8d35ca0 / 2026-11-13-esp1
 предыдущая: 1342976 / e77e85b598e0e240ce2a92aa2427d1450059490c4dbc87bfdd046d6aa87713e0 / 2026-11-13-hunt2
 arc_inject.exe (впрыск закрыт измерением, оставлен для полноты): 958464 bytes
 SHA-256: 2ec75e420b7314eebae10394997ebbb054fbb556b9c6bbb5ce0a59924fcfba7e
@@ -607,3 +608,56 @@ Get-Content "$env:USERPROFILE\esp.ini"
 
 Ничего не проверено в live game; все значения — вывод офлайн-предикатов на одном дампе, они обязаны
 повториться на втором дампе, прежде чем пойти в конфиг оверлея.
+### Первый реальный прогон `(3).DMP` на `esp-chain` — измерено 2026-11-13
+
+```text
+image=0x140000000 size=0x139f9000 global=0x1508feec0   captured_ranges=63459
+obj[0]=0x1390f2500 vtable=0x14e03b0b0 object_header=yes
+obj[1]=0x296f04ed0 vtable=0x14e2802e0 object_header=yes
+obj[2]=0x296a6a6f0 vtable=0x14d65be30 object_header=yes
+obj[3]=0x7f9d55c0  vtable=0x14d8952a0 object_header=yes
+[uworld/level] no round trip in 0x28..0x160 on any chain object
+[level]        no TArray of objects in the first 0x400 bytes of any level candidate
+SUMMARY sampled_objects=4 level_hits=0 actors=0 position_actors=0
+```
+
+Что это уже знает, и это не «снова диагностика»:
+
+* все четыре звена цепочки `0x108FEEC0 -> +0xA0 -> +0x250 -> +0x160` живые и в дампе, и каждый объект
+  имеет корректный UObject-заголовок (vtable внутри образа, слот vtable указывает в код). То есть
+  цепочка §4 не протухла на этом билде — отвалилось именно предположение «последний объект = UWorld»;
+* четыре разных vtable (`0x14e03b0b0`, `0x14e2802e0`, `0x14d65be30`, `0x14d8952a0`) = четыре разных
+  класса, ни один из них не обменивается уровнем по plaintext-указателю в окне `0x28..0x160`;
+* ни у одного из них нет и массива объектов в первых 0x400 байтах, т.е. это не `ULevel` и не владелец
+  `AActor**`. Вывод: обход «от глобала» на этом билде ведёт не туда, и спорить с этим бесполезно —
+  нужен обход «от данных».
+
+Отсюда `esp-actors`: вместо того чтобы угадывать, где лежит мир, он один раз читает все захваченные
+байты дампа и ищет любую структуру `{Data, Num, Max}`, у которой `Num` элементов подряд — указатели на
+объекты с в-image vtable. Дальше по каждому найденному массиву голосует пару `(actor+off -> component,
+component+off -> FVector)` и берёт тот массив, где позиции согласуются и расходятся по осям на сотни
+юнитов. Имена, `FNamePool`, глобалы и live-процесс не участвуют вообще.
+
+Синтетический гейт (`tools/offline-port/run.sh`, переехал в репозиторий, потому что `/tmp` между
+сессиями вычищается): дамп содержит массив актёров на 64 элемента **и** подставной массив на 128
+объектов без позиций. Режим обязан найти оба, поставить подставной в кандидаты, и выбрать настоящий —
+что он и делает: `array[1] … num=64 … owner=0x200004100 at +0xa0` (то есть уровень угадан правильно),
+`component=+0x130 location=+0x11c`, `positions=48/48`, `spread X=2491 Y=1363 Z=329`, а `array[0]`
+(подставной) получает `positions=0` и не помечается как настоящий. Тот же прогон проверяет `esp-chain`
+после рефакторинга стадии 4: раунд-трип `+0x38/+0xe8`, `num=64`, `winner +0x130/+0x11c`,
+`positions 48/48`, и что сломанная цепочка печатает `FAIL` и не пишет ini.
+
+Побочный эффект: `LooksLikeObjectArray` и свип теперь принимают `Num` до 2 000 000 (раньше потолок был
+200 000 — на реальной карте уровня UE такое число актёров достижимо, и гейт молча отбраковывал бы
+настоящий массив).
+
+Команда для пользователя (PowerShell, полные пути; 4-й позиционный — порог `Num`, 5-й — куда писать):
+
+```powershell
+& "$env:USERPROFILE\Downloads\arc_tool.exe" esp-actors "C:\Users\Malin\AppData\Local\Temp\PioneerGame (3).DMP" 0x140000000 0x139F9000 256 "$env:USERPROFILE\esp-actors.txt" *> "$env:USERPROFILE\esp-actors.log"
+```
+
+Ожидание: блок `[candidates] N object arrays`, затем по строке на массив с `vote:`/`spread`, и если
+хотя бы один массив согласуется — строка `[best] … positions=X/Y` и файл с `[positions]`. Ответом может
+быть и `0 object arrays of >= 256 elements` — это значит, что в дампе нет ни одного захваченного
+массива объектов такого размера, и тогда путь один: дамп с захваченной кучой целиком.

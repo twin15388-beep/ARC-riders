@@ -65,6 +65,16 @@ void PrintDumpFNameLayout(
 // single-marker search cannot tell a wrong codec apart from a region the dump never captured.
 // Derives the ESP data path (UWorld/ULevel round trip, actor array, component and position offsets) from
 // a minidump using structural predicates only, so it does not depend on the FName pool or on class names.
+// Positive search for the actor list: sweeps every captured byte for a {Data,Num,Max} whose elements are
+// all objects with in-image vtables, then votes RootComponent/RelativeLocation over each candidate. Needs
+// no global, no chain and no names, so it still works when the known chain no longer lands on UWorld.
+void PrintDumpEspActors(
+    const std::filesystem::path& path,
+    const std::uint64_t image_base,
+    const std::uint64_t image_size,
+    const std::uint32_t min_num,
+    const std::filesystem::path& out_path);
+
 void PrintDumpEspChain(
     const std::filesystem::path& path,
     std::uint64_t image_base,

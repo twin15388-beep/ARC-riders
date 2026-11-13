@@ -2591,7 +2591,7 @@ struct EspReader {
 // to agree with the data pointer, and for a pointer array every element has to be a real object.
 bool LooksLikeObjectArray(const EspReader& mem, const std::uint64_t data_va, const std::uint32_t num,
     const std::uint32_t max, const std::uint32_t probe_limit, std::uint32_t* good) {
-    if (num == 0 || num > 200000U || max < num || data_va < 0x1000) {
+    if (num == 0 || num > 2000000U || max < num || data_va < 0x1000) {
         return false;
     }
     const auto probes = std::min<std::uint32_t>(num, probe_limit);
@@ -2615,6 +2615,138 @@ struct FieldHits {
     std::uint32_t offset{};
     std::uint32_t count{};
 };
+
+// One actor's derived world position, as read at the winning (component, location) pair.
+struct ActorPosition {
+    std::uint64_t actor{};
+    float x{};
+    float y{};
+    float z{};
+};
+
+struct ActorFieldVote {
+    std::vector<FieldHits> root_hits;
+    std::vector<FieldHits> loc_hits;
+    std::uint32_t probed{};
+    std::uint32_t sampled{};
+    std::uint32_t usable{};  // actors that agreed on the winning pair, whether or not a row was kept
+    std::vector<ActorPosition> positions;
+    std::array<std::array<float, 2>, 3> bounds{{
+        {{1.0e30F, -1.0e30F}}, {{1.0e30F, -1.0e30F}}, {{1.0e30F, -1.0e30F}}}};
+
+    [[nodiscard]] bool Winner(std::uint32_t* root_off, std::uint32_t* loc_off) const {
+        if (root_hits.empty() || loc_hits.empty()) {
+            return false;
+        }
+        *root_off = root_hits.front().offset;
+        *loc_off = loc_hits.front().offset;
+        return true;
+    }
+    // How far apart the derived positions are on one axis. A real actor list spreads over hundreds or
+    // thousands of units; a false array (UFunction lists, asset arrays) keeps its "positions" inside a
+    // few units because the floats it reads are unrelated fields of neighbouring objects.
+    [[nodiscard]] float Spread(std::size_t axis) const {
+        return bounds[axis][1] - bounds[axis][0];
+    }
+    [[nodiscard]] bool Sane() const {
+        if (sampled == 0 || usable * 2 < sampled) {
+            return false;
+        }
+        for (std::size_t axis = 0; axis < 3; ++axis) {
+            if (positions.size() >= 2 && Spread(axis) > 20.0F) {
+                return true;
+            }
+        }
+        return positions.size() >= 4;
+    }
+    [[nodiscard]] std::uint32_t Score() const {
+        return usable * 1000U + sampled;
+    }
+};
+
+// AActor -> RootComponent -> USceneComponent::RelativeLocation over a slice of an object array: every
+// plausible (component_off, location_off) pair is counted for every actor, the majority wins, then the
+// positions are re-read at the winning pair. Both esp-chain (array found through a level) and esp-actors
+// (array found by a dump-wide sweep) run through here, so the two cannot drift apart.
+ActorFieldVote VoteActorFields(
+    const EspReader& mem, const std::uint64_t actors_va, const std::uint32_t actor_count,
+    const std::uint32_t probe_limit, const std::size_t row_limit) {
+    ActorFieldVote vote;
+    if (actors_va == 0 || actor_count == 0) {
+        return vote;
+    }
+    const auto probes = std::min<std::uint32_t>(actor_count, probe_limit);
+    vote.probed = probes;
+    for (std::uint32_t i = 0; i < probes; ++i) {
+        const auto actor = mem.Qword(actors_va + i * 8);
+        if (!actor || !mem.LooksLikeObject(*actor)) {
+            continue;
+        }
+        ++vote.sampled;
+        // Record every candidate instead of the first one: the field is the offset the majority of actors
+        // agree on, and a first-match scan reports whichever low offset holds bytes that happen to look
+        // like floats (measured on the synthetic: +0x100 instead of +0x11c).
+        std::set<std::pair<std::uint32_t, std::uint32_t>> pairs;
+        for (std::uint32_t off = 0x100; off + 8 <= 0x400 && pairs.size() < 64; off += 8) {
+            const auto component = mem.Qword(*actor + off);
+            if (!component || !mem.LooksLikeObject(*component)) {
+                continue;
+            }
+            for (std::uint32_t lo = 0x100; lo + 12 <= 0x240 && pairs.size() < 64; lo += 4) {
+                float triple[3];
+                if (!mem.FloatTriple(*component + lo, triple)) {
+                    continue;
+                }
+                if (!pairs.insert({off, lo}).second) {
+                    continue;
+                }
+                for (auto* table : {&vote.root_hits, &vote.loc_hits}) {
+                    const auto want = table == &vote.root_hits ? off : lo;
+                    const auto hit = std::find_if(table->begin(), table->end(),
+                        [want](const FieldHits& item) { return item.offset == want; });
+                    if (hit == table->end()) {
+                        table->push_back({want, 1});
+                    } else {
+                        ++hit->count;
+                    }
+                }
+            }
+        }
+    }
+    const auto rank = [](std::vector<FieldHits> hits) {
+        std::sort(hits.begin(), hits.end(),
+            [](const FieldHits& l, const FieldHits& r) { return l.count > r.count; });
+        return hits;
+    };
+    vote.root_hits = rank(std::move(vote.root_hits));
+    vote.loc_hits = rank(std::move(vote.loc_hits));
+
+    std::uint32_t root_off = 0;
+    std::uint32_t loc_off = 0;
+    if (!vote.Winner(&root_off, &loc_off)) {
+        return vote;
+    }
+    for (std::uint32_t i = 0; i < probes; ++i) {
+        const auto actor = mem.Qword(actors_va + i * 8);
+        if (!actor || !mem.LooksLikeObject(*actor)) {
+            continue;
+        }
+        const auto component = mem.Qword(*actor + root_off);
+        float triple[3];
+        if (!component || !mem.FloatTriple(*component + loc_off, triple)) {
+            continue;
+        }
+        for (std::size_t axis = 0; axis < 3; ++axis) {
+            vote.bounds[axis][0] = std::min(vote.bounds[axis][0], triple[axis]);
+            vote.bounds[axis][1] = std::max(vote.bounds[axis][1], triple[axis]);
+        }
+        ++vote.usable;
+        if (vote.positions.size() < row_limit) {
+            vote.positions.push_back({*actor, triple[0], triple[1], triple[2]});
+        }
+    }
+    return vote;
+}
 
 }  // namespace
 
@@ -2769,56 +2901,12 @@ void PrintDumpEspChain(
 
     // Positions, derived over the whole actor array and voted on, so the reported offset is the one the
     // actors agree on instead of one copied from another build.
-    std::vector<FieldHits> root_hits;
-    std::vector<FieldHits> loc_hits;
-    std::uint32_t sampled = 0;
+    const auto vote = VoteActorFields(mem, actors_va, actor_count, 48, 8);
+    const auto& root_hits = vote.root_hits;
+    const auto& loc_hits = vote.loc_hits;
+    const auto sampled = vote.sampled;
     if (actors_va != 0) {
-        constexpr std::uint32_t kActorProbe = 48;
-        const auto probes = std::min<std::uint32_t>(actor_count, kActorProbe);
-        std::cout << "\n[actors] sampling " << probes << " of " << actor_count << "\n";
-        for (std::uint32_t i = 0; i < probes; ++i) {
-            const auto actor = mem.Qword(actors_va + i * 8);
-            if (!actor || !mem.LooksLikeObject(*actor)) {
-                continue;
-            }
-            ++sampled;
-            // Record every candidate instead of the first one: the field is the offset the majority of
-            // actors agree on, and a first-match scan would report whichever low offset holds bytes that
-            // happen to look like floats.
-            std::set<std::pair<std::uint32_t, std::uint32_t>> pairs;
-            for (std::uint32_t off = 0x100; off + 8 <= 0x400 && pairs.size() < 64; off += 8) {
-                const auto component = mem.Qword(*actor + off);
-                if (!component || !mem.LooksLikeObject(*component)) {
-                    continue;
-                }
-                for (std::uint32_t lo = 0x100; lo + 12 <= 0x240 && pairs.size() < 64; lo += 4) {
-                    float triple[3];
-                    if (!mem.FloatTriple(*component + lo, triple)) {
-                        continue;
-                    }
-                    if (!pairs.insert({off, lo}).second) {
-                        continue;
-                    }
-                    for (auto* table : {&root_hits, &loc_hits}) {
-                        const auto want = table == &root_hits ? off : lo;
-                        const auto hit = std::find_if(table->begin(), table->end(),
-                            [want](const FieldHits& item) { return item.offset == want; });
-                        if (hit == table->end()) {
-                            table->push_back({want, 1});
-                        } else {
-                            ++hit->count;
-                        }
-                    }
-                }
-            }
-        }
-        const auto rank = [](std::vector<FieldHits> hits) {
-            std::sort(hits.begin(), hits.end(),
-                [](const FieldHits& l, const FieldHits& r) { return l.count > r.count; });
-            return hits;
-        };
-        root_hits = rank(std::move(root_hits));
-        loc_hits = rank(std::move(loc_hits));
+        std::cout << "\n[actors] sampling " << vote.probed << " of " << actor_count << "\n";
         std::cout << "  component-offset votes:";
         for (std::size_t i = 0; i < root_hits.size() && i < 6; ++i) {
             std::cout << " +0x" << std::hex << root_hits[i].offset << std::dec << "="
@@ -2830,52 +2918,26 @@ void PrintDumpEspChain(
                       << loc_hits[i].count << "/" << sampled;
         }
         std::cout << "\n";
-        for (std::size_t i = 0; i < root_hits.size() && i < 3; ++i) {
-            std::cout << "    candidate component +0x" << std::hex << root_hits[i].offset << std::dec
-                      << "=" << root_hits[i].count << "\n";
-        }
-        for (std::size_t i = 0; i < loc_hits.size() && i < 3; ++i) {
-            std::cout << "    candidate location +0x" << std::hex << loc_hits[i].offset << std::dec << "="
-                      << loc_hits[i].count << "\n";
-        }
-        if (!root_hits.empty() && !loc_hits.empty()) {
-            const auto root_off = root_hits.front().offset;
-            const auto loc_off = loc_hits.front().offset;
+        std::uint32_t root_off = 0;
+        std::uint32_t loc_off = 0;
+        if (vote.Winner(&root_off, &loc_off)) {
             std::cout << "  winner: [actor+0x" << std::hex << root_off
-                      << "] -> component, [component+0x" << loc_off << std::dec
-                      << "] -> FVector\n";
-            std::uint32_t with_position = 0;
-            std::array<std::array<float, 2>, 3> bounds{{
-                {{1.0e30F, -1.0e30F}}, {{1.0e30F, -1.0e30F}}, {{1.0e30F, -1.0e30F}}}};
-            for (std::uint32_t i = 0; i < probes; ++i) {
-                const auto actor = mem.Qword(actors_va + i * 8);
-                if (!actor || !mem.LooksLikeObject(*actor)) {
-                    continue;
-                }
-                const auto component = mem.Qword(*actor + root_off);
-                float triple[3];
-                if (!component || !mem.FloatTriple(*component + loc_off, triple)) {
-                    continue;
-                }
-                ++with_position;
-                for (std::size_t axis = 0; axis < 3; ++axis) {
-                    bounds[axis][0] = std::min(bounds[axis][0], triple[axis]);
-                    bounds[axis][1] = std::max(bounds[axis][1], triple[axis]);
-                }
-                if (i < 8) {
-                    std::cout << "    actor[" << i << "]=0x" << std::hex << *actor << std::dec << " pos=("
-                              << triple[0] << ", " << triple[1] << ", " << triple[2] << ")\n";
-                }
+                      << "] -> component, [component+0x" << loc_off << std::dec << "] -> FVector\n";
+            for (std::size_t i = 0; i < vote.positions.size(); ++i) {
+                const auto& row = vote.positions[i];
+                std::cout << "    actor[" << i << "]=0x" << std::hex << row.actor << std::dec << " pos=("
+                          << row.x << ", " << row.y << ", " << row.z << ")\n";
             }
-            std::cout << "  positions at the winning offsets: " << with_position << "/" << sampled << "\n";
-            if (with_position != 0) {
-                std::cout << "  spread X=[" << bounds[0][0] << ".." << bounds[0][1] << "] Y=[" << bounds[1][0]
-                          << ".." << bounds[1][1] << "] Z=[" << bounds[2][0] << ".." << bounds[2][1]
+            std::cout << "  positions at the winning offsets: " << vote.usable << "/" << sampled << "\n";
+            if (!vote.positions.empty()) {
+                std::cout << "  spread X=[" << vote.bounds[0][0] << ".." << vote.bounds[0][1]
+                          << "] Y=[" << vote.bounds[1][0] << ".." << vote.bounds[1][1] << "] Z=["
+                          << vote.bounds[2][0] << ".." << vote.bounds[2][1]
                           << "] (a real level spreads over thousands of units on X/Y)\n";
             }
-            if (with_position * 2 < sampled) {
+            if (vote.usable * 2 < sampled) {
                 std::cout << "  note: fewer than half the actors agree on this pair, so it is a candidate"
-                             " and not a measurement - print a wider sample before trusting it.\n";
+                             " and not a measurement.\n";
             }
         }
     }
@@ -2903,7 +2965,7 @@ void PrintDumpEspChain(
                  " why)\n";
 
     std::cout << "\nSUMMARY sampled_objects=" << objects.size() << " level_hits=" << level_hits.size()
-              << " actors=" << actor_count << " position_actors=" << sampled << "\n";
+              << " actors=" << actor_count << " position_actors=" << vote.usable << "\n";
     if (!ini_out.empty()) {
         std::ofstream out(ini_out.string());
         if (!out) {
@@ -2937,6 +2999,206 @@ void PrintDumpEspChain(
             std::cout << "  ini written to " << ini_out << "\n";
         }
     }
+}
+
+void PrintDumpEspActors(
+    const std::filesystem::path& path,
+    const std::uint64_t image_base,
+    const std::uint64_t image_size,
+    const std::uint32_t min_num,
+    const std::filesystem::path& out_path) {
+    if (image_base == 0 || image_size == 0) {
+        throw std::invalid_argument("esp-actors needs the module base and size");
+    }
+    const MappedFile file(path);
+    const auto bytes = file.Bytes();
+    const auto streams = ReadStreams(bytes);
+    const auto ranges = ReadMemoryRanges(bytes, streams);
+    const EspReader mem{bytes, ranges, image_base, image_size};
+
+    std::cout << "build=" << kBuildStamp << "\n";
+    std::cout << "image=0x" << std::hex << image_base << " size=0x" << image_size << std::dec
+              << " captured_ranges=" << ranges.size() << " min_num=" << min_num << "\n";
+    std::cout << "\n[sweep] looking for any captured {Data,Num,Max} whose Num elements are all objects\n";
+    std::cout << "  (this reads every captured byte once; a 12 GB dump takes a couple of minutes)\n";
+
+    struct ArrayHit {
+        std::uint64_t header_va{};
+        std::uint64_t data_va{};
+        std::uint32_t num{};
+        std::uint32_t max{};
+        std::uint32_t distinct{};
+        std::uint64_t owner{};
+        std::uint32_t owner_off{};
+    };
+    constexpr std::size_t kKeepArrays = 4096;
+    std::vector<ArrayHit> hits;
+    std::set<std::uint64_t> seen_data;
+    std::uint64_t slots = 0;
+    std::uint64_t shape_hits = 0;
+    std::uint64_t next_report = 0;
+    for (const auto& range : ranges) {
+        if (range.size < 24 || range.file_offset + range.size > bytes.size()) {
+            continue;
+        }
+        const auto* flat = bytes.data() + range.file_offset;
+        const auto count = static_cast<std::size_t>(range.size / 8);
+        for (std::size_t i = 0; i + 3 <= count; ++i) {
+            const auto* at = flat + i * 8;
+            ++slots;
+            // {Data@+0x00, Num@+0x08, Max@+0x0c} - Max is the dword right after the count, not the one
+            // after that, and reading the wrong half is how every candidate gets rejected.
+            const auto data_va = U64(at);
+            const auto num = U32(at + 8);
+            const auto max = U32(at + 12);
+            if (num < min_num || num > 2000000U || max < num || max > num * 2U + 16U) {
+                continue;
+            }
+            if (data_va < 0x10000 || (data_va & 7U) != 0 || data_va > 0x7FFFFFFFFFFFull) {
+                continue;
+            }
+            ++shape_hits;
+            std::uint32_t good = 0;
+            if (!LooksLikeObjectArray(mem, data_va, num, max, 6, &good)) {
+                continue;
+            }
+            if (!seen_data.insert(data_va).second) {
+                continue;  // one array referenced from several fields is one array
+            }
+            ArrayHit hit;
+            hit.header_va = range.va + i * 8;
+            hit.data_va = data_va;
+            hit.num = num;
+            hit.max = max;
+            // Distinct element vtables separate an actor list (many classes) from a homogeneous asset
+            // array (one class), which is the difference between "actors" and "some UFunction list".
+            std::set<std::uint64_t> vtables;
+            for (std::uint32_t e = 0; e < std::min<std::uint32_t>(num, 16U); ++e) {
+                const auto element = mem.Qword(data_va + e * 8);
+                std::uint64_t vtable = 0;
+                if (element && mem.LooksLikeObject(*element, &vtable)) {
+                    vtables.insert(vtable);
+                }
+            }
+            hit.distinct = static_cast<std::uint32_t>(vtables.size());
+            for (std::uint32_t off = 0x20; off <= 0x400; off += 8) {
+                const auto owner = hit.header_va - off;
+                if (mem.LooksLikeObject(owner)) {
+                    hit.owner = owner;
+                    hit.owner_off = off;
+                    break;
+                }
+            }
+            hits.push_back(hit);
+            if (hits.size() >= kKeepArrays * 2) {  // keep the largest arrays when the count explodes
+                std::sort(hits.begin(), hits.end(), [](const ArrayHit& l, const ArrayHit& r) {
+                    return l.num > r.num;
+                });
+                hits.resize(kKeepArrays);
+            }
+            if (slots >= next_report) {
+                next_report = slots + (1ULL << 27);  // roughly every 1 GB scanned
+                std::cout << "  scanned " << (slots * 8) / (1024 * 1024) << " MB, arrays=" << hits.size()
+                          << "\n";
+            }
+        }
+    }
+
+    std::sort(hits.begin(), hits.end(), [](const ArrayHit& l, const ArrayHit& r) {
+        if (l.num != r.num) {
+            return l.num > r.num;
+        }
+        return l.distinct > r.distinct;
+    });
+    std::cout << "\n[candidates] " << hits.size() << " object arrays of >= " << min_num
+              << " elements kept (slots tried=" << slots << " shape passes=" << shape_hits
+              << " array matches=" << seen_data.size() << ")\n";
+    if (hits.empty()) {
+        std::cout << "  no array of object pointers with at least " << min_num
+                  << " elements is captured in this dump. Lower the threshold (4th argument) before"
+                     " concluding anything: with 8 the same sweep also reports small lists.\n";
+        return;
+    }
+
+    const std::size_t report = std::min<std::size_t>(hits.size(), 10);
+    std::vector<std::pair<std::uint32_t, std::size_t>> ranked;  // (score, index)
+    std::vector<ActorFieldVote> votes(report);
+    for (std::size_t index = 0; index < report; ++index) {
+        const auto& hit = hits[index];
+        std::cout << "\n  array[" << index << "] header=0x" << std::hex << hit.header_va << std::dec
+                  << " num=" << hit.num << " max=" << hit.max << " data=0x" << std::hex << hit.data_va
+                  << std::dec << " distinct_element_vtables=" << hit.distinct;
+        if (hit.owner != 0) {
+            std::cout << "  owner=0x" << std::hex << hit.owner << " at +0x" << hit.owner_off << std::dec;
+        }
+        std::cout << "\n";
+        votes[index] = VoteActorFields(mem, hit.data_va, hit.num, 48, 4096);
+        std::uint32_t root_off = 0;
+        std::uint32_t loc_off = 0;
+        const bool winner = votes[index].Winner(&root_off, &loc_off);
+        std::cout << "    vote: sampled=" << votes[index].sampled << " positions="
+                  << votes[index].usable << (votes[index].usable > votes[index].positions.size()
+                      ? " (rows kept " + std::to_string(votes[index].positions.size()) + ")"
+                      : "");
+        if (winner) {
+            std::cout << " component=+0x" << std::hex << root_off << " location=+0x" << loc_off << std::dec;
+        }
+        if (!votes[index].positions.empty()) {
+            std::cout << " spread X=" << votes[index].Spread(0) << " Y=" << votes[index].Spread(1) << " Z="
+                      << votes[index].Spread(2);
+        }
+        std::cout << (votes[index].Sane() ? "  <- consistent with a real actor list" : "") << "\n";
+        ranked.emplace_back(votes[index].Score(), index);
+    }
+    std::sort(ranked.begin(), ranked.end(), std::greater<>());
+    const auto best = ranked.front().second;
+    const auto& hit = hits[best];
+    const auto& vote = votes[best];
+    std::uint32_t root_off = 0;
+    std::uint32_t loc_off = 0;
+    const bool winner = vote.Winner(&root_off, &loc_off);
+
+    std::cout << "\n[best] array[" << best << "] num=" << hit.num << " data=0x" << std::hex << hit.data_va
+              << std::dec << " positions=" << vote.usable << "/" << vote.sampled << "\n";
+    for (std::size_t i = 0; i < vote.positions.size() && i < 8; ++i) {
+        const auto& row = vote.positions[i];
+        std::cout << "    actor[" << i << "]=0x" << std::hex << row.actor << std::dec << " pos=(" << row.x
+                  << ", " << row.y << ", " << row.z << ")\n";
+    }
+    if (!winner) {
+        std::cout << "  no component/location pair was agreed on: the array holds objects, but they are"
+                     " not positioned actors - the search has to start from a different container.\n";
+    }
+
+    if (out_path.empty()) {
+        return;
+    }
+    std::ofstream out(out_path.string());
+    if (!out) {
+        std::cout << "  could not write " << out_path << "\n";
+        return;
+    }
+    out << "# esp-actors: derived offline by structural predicates; not validated in a live process\n";
+    out << "[esp]\n";
+    out << "image_base = 0x" << std::hex << image_base << std::dec << "\n";
+    out << "actor_array_header = 0x" << std::hex << hit.header_va << std::dec << "\n";
+    out << "actor_array_num = " << std::dec << hit.num << "\n";
+    out << "level_actors_off = 0x" << std::hex << hit.owner_off << std::dec << "\n";
+    out << "level = 0x" << std::hex << hit.owner << std::dec << "\n";
+    if (winner) {
+        out << "root_component_off = 0x" << std::hex << root_off << std::dec << "\n";
+        out << "relative_location_off = 0x" << std::hex << loc_off << std::dec << "\n";
+        out << "# positions written: " << vote.positions.size() << " of " << vote.usable
+            << " agreed, out of " << vote.sampled << " actors sampled\n";
+        out << "[positions]\n";
+        for (std::size_t i = 0; i < vote.positions.size(); ++i) {
+            const auto& row = vote.positions[i];
+            out << "actor_" << i << " = 0x" << std::hex << row.actor << std::dec << ", " << row.x << ", "
+                << row.y << ", " << row.z << "\n";
+        }
+    }
+    std::cout << "  written to " << out_path << " (" << vote.positions.size() << " rows, "
+              << vote.usable << " agreed)\n";
 }
 
 } // namespace arc
