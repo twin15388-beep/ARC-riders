@@ -214,6 +214,10 @@ dump-fname-blocks <DMP> <ImageBase> <ImageSize> [block0_VA] [block_size] [min_en
 .\arc_tool.exe dump-fname-blocks "C:\Users\Malin\AppData\Local\Temp\PioneerGame (3).DMP" 0x140000000 0x139F9000
 ```
 
+EXE в Dropbox: `/arc_tool.exe`, rev `660263c4bcaa54b309220`, размер `1,190,912`, SHA-256
+`3a7892ba226b7cb5d79e6eeba5e255fc0971425335519d39ab7a99421b23174e` (загружено 2026-11-13). В репозитории
+тот же файл лежит как `out/arc_tool.exe`, сам `out/` в git не попадает.
+
 Проверено на синтетическом MDMP (три блока, данные НЕ выровнены по 0x20000, указатель на заголовок
 нулевого блока внутри образа): якорь найден, заголовок `0x10` определён probing-ом, цепочка
 `blocks=3 names=210`, referrer `[image] RVA=0x100`, `PREDICATE PASS`. На реальном дампе команда ещё не
