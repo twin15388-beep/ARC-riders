@@ -71,6 +71,39 @@ int main(int argc, char** argv) try {
             chain_list, ini_out);
         return 0;
     }
+    if (mode == "esp-export" && argc >= 4) {
+        std::filesystem::path config_path;
+        std::filesystem::path out_path;
+        std::uint64_t limit = 4096;
+        bool have_limit = false;
+        for (int i = 5; i < argc; ++i) {
+            const std::string_view arg{argv[i]};
+            if (EndsWith(arg, ".js") || EndsWith(arg, ".json")) {
+                out_path = arg;
+                continue;
+            }
+            if (EndsWith(arg, ".ini") || EndsWith(arg, ".txt") || EndsWith(arg, ".cfg")) {
+                if (config_path.empty()) {
+                    config_path = arg;
+                } else {
+                    out_path = arg;
+                }
+                continue;
+            }
+            if (!have_limit) {
+                limit = ParseUnsigned(arg);
+                have_limit = true;
+                continue;
+            }
+            throw std::invalid_argument("esp-export takes [out.js] [row_limit] after the config");
+        }
+        if (config_path.empty()) {
+            throw std::invalid_argument("esp-export needs a config ini");
+        }
+        arc::PrintDumpEspExport(argv[2], ParseUnsigned(argv[3]), ParseUnsigned(argv[4]), config_path,
+            out_path, static_cast<std::size_t>(limit));
+        return 0;
+    }
     if (mode == "esp-actors" && argc >= 4) {
         std::uint64_t min_num = 64;
         bool have_min = false;

@@ -65,6 +65,17 @@ void PrintDumpFNameLayout(
 // single-marker search cannot tell a wrong codec apart from a region the dump never captured.
 // Derives the ESP data path (UWorld/ULevel round trip, actor array, component and position offsets) from
 // a minidump using structural predicates only, so it does not depend on the FName pool or on class names.
+// Turns a resolved actor list into what an overlay consumes: positions, distance, world-to-screen,
+// health/team when those offsets are configured, written as JSON (or as a .js assignment the bundled
+// overlay can load over file://). Reads its offsets from an ini, so the exporter never hardcodes a build.
+void PrintDumpEspExport(
+    const std::filesystem::path& path,
+    std::uint64_t image_base,
+    std::uint64_t image_size,
+    const std::filesystem::path& config_path,
+    const std::filesystem::path& out_path,
+    std::size_t row_limit);
+
 // Positive search for the actor list: sweeps every captured byte for a {Data,Num,Max} whose elements are
 // all objects with in-image vtables, then votes RootComponent/RelativeLocation over each candidate. Needs
 // no global, no chain and no names, so it still works when the known chain no longer lands on UWorld.

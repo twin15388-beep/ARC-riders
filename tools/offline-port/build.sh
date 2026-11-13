@@ -11,5 +11,6 @@ g++ -std=c++20 -g -O1 -Wall -Wextra -Wpedantic -Werror -D_WIN32 \
     -I"$here" -I"$repo/src" \
     "$here/probe_main.cpp" "$here/shim.cpp" \
     "$repo/src/DumpFile.cpp" "$repo/src/Names.cpp" "$repo/src/Pattern.cpp" "$repo/src/Chain.cpp" \
+    "$repo/src/Esp.cpp" \
     -o "$out/probe"
 echo "built $out/probe"

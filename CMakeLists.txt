@@ -8,6 +8,7 @@ add_library(arc_core
     src/Config.cpp
     src/Names.cpp
     src/Pattern.cpp
+    src/Esp.cpp
     src/Usmap.cpp
     src/ArcDecrypt.cpp
 )

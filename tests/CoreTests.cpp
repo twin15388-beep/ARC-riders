@@ -1,4 +1,5 @@
 #include "Chain.h"
+#include "Esp.h"
 #include "Config.h"
 #include "Pattern.h"
 #include "Names.h"
@@ -6,6 +7,7 @@
 #include "ArcDecrypt.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <array>
@@ -480,6 +482,194 @@ void TestViewportDecrypt() {
     }, "short viewport bank accepted");
 }
 
+
+[[nodiscard]] bool Near(const double value, const double expected, const double tolerance = 1.0e-6) {
+    return std::fabs(value - expected) <= tolerance;
+}
+
+// The exporter's memory is an interface, so the whole read-project-serialise path is testable without a
+// dump, a process, or Windows. This fake is the same shape a minidump reader has: VA in, bytes out.
+struct FakeMemory final : arc::IMemory {
+    std::uint64_t base{};
+    std::vector<std::uint8_t> bytes;
+
+    template <typename T>
+    void Put(const std::uint64_t va, const T value) {
+        const auto offset = va - base;
+        if (offset + sizeof(T) > bytes.size()) {
+            bytes.resize(static_cast<std::size_t>(offset + sizeof(T)));
+        }
+        std::memcpy(bytes.data() + offset, &value, sizeof(T));
+    }
+
+    [[nodiscard]] std::optional<std::uint64_t> Qword(const std::uint64_t va) const override {
+        return Read<std::uint64_t>(va);
+    }
+    [[nodiscard]] std::optional<double> Double(const std::uint64_t va) const override {
+        return Read<double>(va);
+    }
+    [[nodiscard]] std::optional<float> Float(const std::uint64_t va) const override {
+        return Read<float>(va);
+    }
+    [[nodiscard]] std::optional<std::uint32_t> Dword(const std::uint64_t va) const override {
+        return Read<std::uint32_t>(va);
+    }
+
+private:
+    template <typename T>
+    [[nodiscard]] std::optional<T> Read(const std::uint64_t va) const {
+        const auto offset = va - base;
+        if (va < base || offset + sizeof(T) > bytes.size()) {
+            return std::nullopt;
+        }
+        T value{};
+        std::memcpy(&value, bytes.data() + offset, sizeof(T));
+        return value;
+    }
+};
+
+void TestEspMath() {
+    Check(arc::IsPlausiblePosition(arc::FVector{100.0, -200.0, 300.0}), "plain position rejected");
+    Check(arc::IsPlausiblePosition(arc::FVector{0.0, 0.0, 1200.0}), "zero axis rejected as a position");
+    Check(!arc::IsPlausiblePosition(arc::FVector{0.0, 0.0, 0.0 / 0.0}), "NaN accepted as a position");
+    Check(!arc::IsPlausiblePosition(arc::FVector{1.0e30, 1.0, 1.0}), "infinite magnitude accepted");
+    // The measured failure: a 64-bit pointer read as two floats gives denormals like this, and the sweep
+    // on a real dump voted for exactly that field.
+    Check(!arc::IsPlausiblePosition(arc::FVector{1.4e-45, 2.0, 3.0}), "denormal axis accepted as a position");
+    Check(!arc::IsPositionCandidate(arc::FVector{0.0, 200.0, 300.0}), "zero axis accepted as a candidate");
+    Check(arc::IsPositionCandidate(arc::FVector{1000.0, -2000.0, 100.0}), "candidate rejected");
+
+    Check(Near(arc::DistanceMetres(arc::FVector{}, arc::FVector{100.0, 0.0, 0.0}), 1.0), "distance metres");
+    Check(Near(arc::DistanceMetres(arc::FVector{0.0, 0.0, 0.0}, arc::FVector{300.0, 400.0, 0.0}), 5.0),
+        "3-4-5 distance");
+
+    arc::FVector forward{};
+    arc::FVector right{};
+    arc::FVector up{};
+    arc::CameraBasis(arc::FRotator{0.0, 0.0, 0.0}, &forward, &right, &up);
+    Check(Near(forward.x, 1.0) && Near(forward.y, 0.0) && Near(up.z, 1.0), "zero rotation basis");
+    arc::CameraBasis(arc::FRotator{0.0, 90.0, 0.0}, &forward, &right, &up);
+    Check(Near(forward.x, 0.0, 1.0e-9) && Near(forward.y, 1.0, 1.0e-9), "yaw 90 basis");
+    arc::CameraBasis(arc::FRotator{90.0, 0.0, 0.0}, &forward, &right, &up);
+    Check(Near(forward.z, 1.0, 1.0e-9), "pitch 90 looks up");
+
+    arc::Viewport view;
+    view.fov_degrees = 90.0;
+    view.width = 1920;
+    view.height = 1080;
+    Check(Near(std::tan(view.VerticalFovDegrees() * 3.14159265358979323846 / 360.0), 9.0 / 16.0, 1.0e-9),
+        "vertical fov from aspect");
+
+    double x = -1.0;
+    double y = -1.0;
+    double depth = -1.0;
+    Check(arc::WorldToScreen(arc::FVector{100.0, 0.0, 0.0}, view, &x, &y, &depth), "in front failed");
+    Check(Near(x, 960.0, 1.0e-6) && Near(y, 540.0, 1.0e-6) && Near(depth, 100.0), "centre projection");
+    // Straight up by tan(half vertical fov) * depth lands on the top edge, which is the projection test
+    // that would notice a swapped or missing aspect correction.
+    Check(arc::WorldToScreen(arc::FVector{100.0, 0.0, 56.25}, view, &x, &y, &depth), "top edge failed");
+    Check(Near(x, 960.0, 1.0e-6) && Near(y, 0.0, 1.0e-6), "aspect-corrected vertical projection");
+    Check(!arc::WorldToScreen(arc::FVector{-100.0, 0.0, 0.0}, view, &x, &y, &depth),
+        "behind the camera projected");
+    Check(!arc::WorldToScreen(arc::FVector{5.0, 0.0, 0.0}, view, &x, &y, &depth), "inside near plane projected");
+    Check(arc::WorldToScreen(arc::FVector{0.0, 100.0, 0.0}, view, &x, &y, &depth) == false ||
+              Near(x, 960.0 + 100.0 / 100.0 * 960.0, 1.0e-3),
+        "lateral offset projection");
+
+    // A box has to shrink with distance and scale with the viewport, or the overlay looks wrong at 400 m.
+    const double near_px = arc::ScreenRadiusPixels(1000.0, 100.0, view);
+    const double far_px = arc::ScreenRadiusPixels(2000.0, 100.0, view);
+    // (100 cm / 1000 cm) / tan(vertical half fov = 9/16) * half the screen height
+    Check(Near(near_px, 0.1 / (9.0 / 16.0) * 540.0, 1.0e-6), "screen radius");
+    Check(Near(far_px, near_px * 0.5, 1.0e-6), "radius does not halve with depth");
+    Check(arc::ScreenRadiusPixels(1.0, 100.0, view) == 0.0, "radius inside the near plane");
+}
+
+void TestEspConfigAndRows() {
+    const auto offsets = arc::ParseEspConfig(
+        "[build]\nmodule_name = PioneerGame.exe\n"
+        "[esp]\n# a comment and a blank line\n\n"
+        "actor_array_data = 0x1000\nactor_array_num = 3\n"
+        "root_component_off = 0x130\nrelative_location_off = 0x11C\n"
+        "level_actors_off = 0xa0\npersistent_level_off = 0xe8\n"
+        "local_x = 0\nlocal_y = 0\nlocal_z = 0\nview_yaw_degrees = 0\nfov_degrees = 90\n"
+        "screen_width = 1920\nscreen_height = 1080\nactor_radius_cm = 100\n"
+        "health_off = 0x200\nteam_off = 0x208\n");
+    Check(offsets.actor_array_data == 0x1000 && offsets.actor_array_num == 3, "actor list keys");
+    Check(offsets.root_component_off == 0x130 && offsets.relative_location_off == 0x11C, "position keys");
+    Check(offsets.screen_width == 1920 && Near(offsets.fov_degrees, 90.0), "screen keys");
+    Check(offsets.HasActorList() && offsets.HasPositions(), "resolved config reported as incomplete");
+    Check(arc::ParseEspConfig("[esp]\nrelative_location_off = 0\n").relative_location_off == 0,
+        "unset key got a default");
+
+    FakeMemory memory;
+    memory.base = 0x1000;
+    memory.Put<std::uint64_t>(0x1000, 0x2000);  // actors[0]
+    memory.Put<std::uint64_t>(0x1008, 0x2100);  // actors[1]
+    memory.Put<std::uint64_t>(0x1010, 0x2200);  // actors[2]: has a NaN position
+    memory.Put<std::uint64_t>(0x2000 + 0x130, 0x3000);
+    memory.Put<std::uint64_t>(0x2100 + 0x130, 0x3100);
+    memory.Put<std::uint64_t>(0x2200 + 0x130, 0x3200);
+    memory.Put<float>(0x3000 + 0x11C, 1000.0F);
+    memory.Put<float>(0x3000 + 0x11C + 4, -2000.0F);
+    memory.Put<float>(0x3000 + 0x11C + 8, 100.0F);
+    memory.Put<float>(0x3100 + 0x11C, 2000.0F);
+    memory.Put<float>(0x3100 + 0x11C + 4, -1000.0F);
+    memory.Put<float>(0x3100 + 0x11C + 8, 50.0F);
+    memory.Put<float>(0x3200 + 0x11C, 0.0F / 0.0F);
+    memory.Put<float>(0x3200 + 0x11C + 4, 1.0F);
+    memory.Put<float>(0x3200 + 0x11C + 8, 1.0F);
+    memory.Put<float>(0x2000 + 0x200, 73.0F);   // health
+    memory.Put<std::uint32_t>(0x2000 + 0x208, 2U);  // team
+
+    const auto rows = arc::ReadActors(memory, offsets, 16);
+    Check(rows.size() == 2, "rows read from the fake memory");
+    Check(rows[0].address == 0x2000, "row address");
+    Check(Near(rows[0].distance_m, std::sqrt(1000.0 * 1000.0 + 2000.0 * 2000.0 + 100.0 * 100.0) / 100.0,
+            1.0e-9),
+        "row distance");
+    Check(rows[0].projected, "row not projected");
+    Check(Near(rows[0].screen_x, 960.0 + (-2000.0 / 1000.0) * 960.0, 1.0e-3), "row screen x");
+    Check(rows[0].box_half_height > 0.0, "box has no height");
+    Check(rows[0].has_health && Near(rows[0].health, 73.0, 1.0e-6), "health not read");
+    Check(rows[0].has_team && rows[0].team == 2U, "team not read");
+
+    const auto json = arc::ToJson(rows, offsets, 3, true, "test note");
+    Check(json.rfind("window.ARC = ", 0) == 0, "js wrapper missing");
+    Check(json.find("\"actors_with_position\": 2") != std::string::npos, "row count missing");
+    Check(json.find("\"actors_total\": 3") != std::string::npos, "actor total missing");
+    Check(json.find("\"id\": \"0x2000\"") != std::string::npos, "row id missing");
+    Check(json.find("\"hp\": 73.00") != std::string::npos, "health missing from json");
+    Check(json.find("\"hp\": null") != std::string::npos, "missing health was invented");
+    Check(json.find("test note") != std::string::npos, "note missing");
+    Check(arc::ToJson(rows, offsets, 3, false, "").rfind("{", 0) == 0, "json wrapper wrong");
+
+    // Aim and trigger rules, on the projected rows only.
+    const auto pick = arc::SelectAimTarget(rows, 960.0, 540.0, 4000.0);
+    Check(pick.has_value(), "no aim target although rows are projected");
+    Check(rows[pick->index].address == rows[0].address || rows[pick->index].address == rows[1].address,
+        "aim pick is not one of the rows");
+    Check(pick->offset_px <= 4000.0, "aim pick ignores the cone");
+    Check(!arc::SelectAimTarget(rows, 960.0, 540.0, 0.5).has_value(), "aim cone of half a pixel widened");
+    Check(!arc::SelectAimTarget({}, 960.0, 540.0, 500.0).has_value(), "empty row set picked a target");
+    Check(arc::IsOnAimPoint(rows[0], rows[0].screen_x, rows[0].screen_y, 0.0),
+        "centre of the actor's own box is not on the aim point");
+    Check(!arc::IsOnAimPoint(rows[0], rows[0].screen_x + 5.0e5, rows[0].screen_y, 0.0),
+        "trigger fires far outside the box");
+    Check(!rows[1].projected || !arc::IsOnAimPoint(rows[1], -1.0, -1.0, 0.0), "trigger fires off-screen");
+
+    const auto page = arc::OverlayHtml();
+    Check(page.find("window.ARC") != std::string::npos, "overlay does not read the exported data");
+    Check(page.find("<canvas") != std::string::npos, "overlay has no canvas");
+    Check(page.find("esp-data.js") != std::string::npos, "overlay ignores the exporter's file name");
+
+    // An unset position offset must produce no rows at all rather than reading from address 0x11c.
+    arc::EspOffsetSet partial;
+    partial.actor_array_data = 0x1000;
+    partial.actor_array_num = 3;
+    Check(arc::ReadActors(memory, partial, 8).empty(), "rows produced without position offsets");
+}
+
 } // namespace
 
 int main() {
@@ -494,6 +684,8 @@ int main() {
         TestBackwardChain();
         TestPackedCodec();
         TestViewportDecrypt();
+        TestEspMath();
+        TestEspConfigAndRows();
         std::cout << "All core checks passed\n";
         return 0;
     } catch (const std::exception& error) {

@@ -2,6 +2,7 @@
 
 #include "DumpFile.h"
 
+#include "Esp.h"
 #include "Names.h"
 #include "PeFile.h"
 #include "Process.h"
@@ -9,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -2561,8 +2563,7 @@ struct EspReader {
         }
         return true;
     }
-    // A world position: three finite floats, at least one non-trivial, magnitudes inside what a level
-    // blueprint uses. Zero triples (components at the origin) and NaN/inf garbage are both rejected.
+    // A world position: three floats that arc::IsPositionCandidate accepts - see below.
     [[nodiscard]] bool FloatTriple(const std::uint64_t va, float out[3]) const {
         const auto span = ReadCaptured(bytes, ranges, va, 12);
         if (!span || span->size() < 12) {
@@ -2570,17 +2571,13 @@ struct EspReader {
         }
         float values[3];
         std::memcpy(values, span->data(), sizeof(values));
-        for (const auto value : values) {
-            const auto absolute = value < 0.0F ? -value : value;
-            if (absolute == 0.0F) {
-                return false;  // a zero axis makes the read ambiguous by one float
-            }
-            // The halves of a 64-bit pointer read as floats come out denormal or tiny, so this band is
-            // what stops the next object's vtable from being accepted as a coordinate - measured on the
-            // synthetic, where components sit 0x100 apart and the lowest offset was exactly that.
-            if (absolute < 1.0e-2F || absolute > 1.0e6F) {
-                return false;  // NaN, denormal, rotation-sized noise, or an impossible coordinate
-            }
+        // One definition of "this triple could be a coordinate", shared with the exporter and its unit
+        // tests: a magnitude band, no denormals (that is what a pointer half reads as), no NaN, no zero
+        // axis. The real `(3).DMP` sweep proved the cost of getting this wrong - the winning candidate
+        // printed (-nan, -nan, -nan) for 40 rows because only magnitudes were compared, and NaN fails
+        // every comparison.
+        if (!IsPositionCandidate(FVector{values[0], values[1], values[2]})) {
+            return false;
         }
         std::memcpy(out, values, sizeof(values));
         return true;
@@ -2611,6 +2608,49 @@ bool LooksLikeObjectArray(const EspReader& mem, const std::uint64_t data_va, con
 // AActor -> RootComponent -> USceneComponent::RelativeLocation, derived from the dump rather than
 // assumed: for every object-pointer slot of every actor, does that component hold a float triple that
 // looks like a position. The offset that most actors agree on is the field.
+// arc::IMemory over the mapped dump, so ReadActors/ReadLocalView run identically here and in the unit
+// tests - one implementation of "walk the actor list and project it", not one per caller.
+struct DumpMemory final : IMemory {
+    DumpMemory(std::span<const std::uint8_t> file_bytes, const std::vector<MemoryRange>* file_ranges)
+        : bytes(file_bytes), ranges(file_ranges) {}
+
+    std::span<const std::uint8_t> bytes;
+    const std::vector<MemoryRange>* ranges{};
+
+    [[nodiscard]] std::optional<std::uint64_t> Qword(const std::uint64_t va) const override {
+        const auto span = ReadCaptured(bytes, *ranges, va, 8);
+        if (!span || span->size() < 8) {
+            return std::nullopt;
+        }
+        return U64(span->data());
+    }
+    [[nodiscard]] std::optional<double> Double(const std::uint64_t va) const override {
+        const auto span = ReadCaptured(bytes, *ranges, va, 8);
+        if (!span || span->size() < 8) {
+            return std::nullopt;
+        }
+        double value = 0.0;
+        std::memcpy(&value, span->data(), sizeof(value));
+        return value;
+    }
+    [[nodiscard]] std::optional<float> Float(const std::uint64_t va) const override {
+        const auto span = ReadCaptured(bytes, *ranges, va, 4);
+        if (!span || span->size() < 4) {
+            return std::nullopt;
+        }
+        float value = 0.0F;
+        std::memcpy(&value, span->data(), sizeof(value));
+        return value;
+    }
+    [[nodiscard]] std::optional<std::uint32_t> Dword(const std::uint64_t va) const override {
+        const auto span = ReadCaptured(bytes, *ranges, va, 4);
+        if (!span || span->size() < 4) {
+            return std::nullopt;
+        }
+        return U32(span->data());
+    }
+};
+
 struct FieldHits {
     std::uint32_t offset{};
     std::uint32_t count{};
@@ -2649,15 +2689,18 @@ struct ActorFieldVote {
         return bounds[axis][1] - bounds[axis][0];
     }
     [[nodiscard]] bool Sane() const {
-        if (sampled == 0 || usable * 2 < sampled) {
+        if (sampled == 0 || usable == 0 || positions.size() < 2 || usable * 2 < sampled) {
             return false;
         }
+        // At least one axis has to be spread over real level distances. Bounds are only touched by
+        // positions that passed the plausibility filter, so an uninitialised axis is a real signal here.
         for (std::size_t axis = 0; axis < 3; ++axis) {
-            if (positions.size() >= 2 && Spread(axis) > 20.0F) {
+            const float spread = Spread(axis);
+            if (std::isfinite(spread) && spread > 20.0F && spread < 1.0e7F) {
                 return true;
             }
         }
-        return positions.size() >= 4;
+        return false;
     }
     [[nodiscard]] std::uint32_t Score() const {
         return usable * 1000U + sampled;
@@ -2989,6 +3032,8 @@ void PrintDumpEspChain(
             }
             if (actors_va != 0) {
                 out << "level_actors_off = 0x" << std::hex << actors_off << std::dec << "\n";
+                out << "actor_array_data = 0x" << std::hex << actors_va << std::dec << "\n";
+                out << "actor_array_num = " << actor_count << "\n";
             }
             if (!root_hits.empty()) {
                 out << "root_component_off = 0x" << std::hex << root_hits[0].offset << std::dec << "\n";
@@ -3143,9 +3188,13 @@ void PrintDumpEspActors(
         if (winner) {
             std::cout << " component=+0x" << std::hex << root_off << " location=+0x" << loc_off << std::dec;
         }
-        if (!votes[index].positions.empty()) {
+        if (!votes[index].positions.empty() && std::isfinite(votes[index].Spread(0))) {
             std::cout << " spread X=" << votes[index].Spread(0) << " Y=" << votes[index].Spread(1) << " Z="
                       << votes[index].Spread(2);
+        }
+        if (votes[index].usable != 0 && !votes[index].Sane()) {
+            std::cout << "  (rejected: the agreed rows do not spread over a level, so they are fields that"
+                         " merely look like coordinates)";
         }
         std::cout << (votes[index].Sane() ? "  <- consistent with a real actor list" : "") << "\n";
         ranked.emplace_back(votes[index].Score(), index);
@@ -3182,7 +3231,14 @@ void PrintDumpEspActors(
     out << "[esp]\n";
     out << "image_base = 0x" << std::hex << image_base << std::dec << "\n";
     out << "actor_array_header = 0x" << std::hex << hit.header_va << std::dec << "\n";
-    out << "actor_array_num = " << std::dec << hit.num << "\n";
+    out << "actor_array_data = 0x" << std::hex << hit.data_va << std::dec << "\n";
+    out << "# to feed a world address from another source instead of the swept array, uncomment:\n";
+    out << "# world_va = 0x0\n";
+    out << "actor_array_num = " << hit.num << "\n";
+    out << "# screen the overlay should project into - edit these, esp-export reads them back\n";
+    out << "screen_width = 1920\n";
+    out << "screen_height = 1080\n";
+    out << "fov_degrees = 90\n";
     out << "level_actors_off = 0x" << std::hex << hit.owner_off << std::dec << "\n";
     out << "level = 0x" << std::hex << hit.owner << std::dec << "\n";
     if (winner) {
@@ -3199,6 +3255,185 @@ void PrintDumpEspActors(
     }
     std::cout << "  written to " << out_path << " (" << vote.positions.size() << " rows, "
               << vote.usable << " agreed)\n";
+    std::cout << "  next: arc_tool esp-export <this dump> 0x" << std::hex << image_base << " 0x"
+              << image_size << " " << out_path << " overlay.js\n" << std::dec;
+}
+
+void PrintDumpEspExport(
+    const std::filesystem::path& path,
+    const std::uint64_t image_base,
+    const std::uint64_t image_size,
+    const std::filesystem::path& config_path,
+    const std::filesystem::path& out_path,
+    const std::size_t row_limit) {
+    EspOffsetSet offsets;
+    try {
+        offsets = LoadEspConfig(config_path);
+    } catch (const std::exception& error) {
+        std::cout << "FAIL: " << error.what() << "\n";
+        return;
+    }
+    if (!offsets.HasPositions()) {
+        std::cout << "FAIL: the config has no root_component_off + relative_location_off, so there is"
+                     " nothing to read. Run esp-actors (or esp-chain) with this dump and pass the ini it"
+                     " writes.\n";
+        return;
+    }
+
+    const MappedFile file(path);
+    const auto bytes = file.Bytes();
+    const auto streams = ReadStreams(bytes);
+    const auto ranges = ReadMemoryRanges(bytes, streams);
+    const DumpMemory memory{bytes, &ranges};
+
+    std::cout << "build=" << kBuildStamp << "\n";
+    std::cout << "image=0x" << std::hex << image_base << " size=0x" << image_size << std::dec
+              << " captured_ranges=" << ranges.size() << "\n";
+    std::cout << "config=" << config_path << "\n";
+
+    std::string note;
+    // The sweep writes actor_array_data/actor_array_num, so a file it produced needs no chain at all.
+    // Otherwise fall back to walking the configured chain into the world and the level's array field.
+    if (!offsets.HasActorList()) {
+        if (offsets.global_rva == 0 || offsets.chain.empty() || offsets.persistent_level_off == 0 ||
+            offsets.level_actors_off == 0) {
+            std::cout << "FAIL: no actor_array_data in the config and not enough keys to reach one by"
+                         " chain (needs global_rva, chain, persistent_level_off, level_actors_off).\n";
+            return;
+        }
+        // `world_va` is the shortcut for a world address taken from somewhere else: the level field is
+        // read straight off it and the chain is not walked at all.
+        if (offsets.world_va != 0) {
+            const auto level = memory.Qword(offsets.world_va + offsets.persistent_level_off);
+            const auto data =
+                level ? memory.Qword(*level + offsets.level_actors_off) : std::nullopt;
+            const auto num =
+                level ? memory.Dword(*level + offsets.level_actors_off + 8) : std::nullopt;
+            if (data && num && *num != 0 && *num <= 2000000U) {
+                offsets.actor_array_data = *data;
+                offsets.actor_array_num = *num;
+                std::cout << "array via world_va: level=0x" << std::hex << *level << " data=0x" << *data
+                          << std::dec << " num=" << *num << "\n";
+            } else {
+                std::cout << "FAIL: world_va=0x" << std::hex << offsets.world_va << std::dec
+                          << " did not give an actor array at [world+0x" << std::hex
+                          << offsets.persistent_level_off << "]+0x" << offsets.level_actors_off << std::dec
+                          << ". The level field or the array field belongs to another build.\n";
+                return;
+            }
+        }
+        std::vector<std::uint64_t> objects;
+        auto cursor = image_base + offsets.global_rva;
+        const auto first = memory.Qword(cursor);
+        if (!first) {
+            std::cout << "FAIL: the global at base+0x" << std::hex << offsets.global_rva << std::dec
+                      << " is not captured in this dump.\n";
+            return;
+        }
+        cursor = *first;
+        objects.push_back(cursor);
+        for (const auto step : offsets.chain) {
+            const auto value = memory.Qword(cursor + step);
+            if (!value) {
+                std::cout << "FAIL: chain step +0x" << std::hex << step << std::dec
+                          << " is not captured.\n";
+                return;
+            }
+            cursor = *value;
+            objects.push_back(cursor);
+        }
+        bool found = false;
+        for (const auto candidate : objects) {
+            const auto level = memory.Qword(candidate + offsets.persistent_level_off);
+            if (!level) {
+                continue;
+            }
+            const auto data = memory.Qword(*level + offsets.level_actors_off);
+            const auto num = memory.Dword(*level + offsets.level_actors_off + 8);
+            if (!data || !num || *num == 0 || *num > 2000000U) {
+                continue;
+            }
+            offsets.actor_array_data = *data;
+            offsets.actor_array_num = *num;
+            std::cout << "array via chain: world=0x" << std::hex << candidate << " level=0x" << *level
+                      << " data=0x" << *data << std::dec << " num=" << *num << "\n";
+            found = true;
+            break;
+        }
+        if (!found) {
+            std::cout << "FAIL: no object on the chain gave a plausible actor array at"
+                         " [world+0x" << std::hex << offsets.persistent_level_off << "]+0x"
+                      << offsets.level_actors_off << std::dec
+                      << ". This is the same answer esp-chain gave: the chain does not end at UWorld in"
+                         " this build.\n";
+            return;
+        }
+    }
+
+    // A camera in the snapshot makes the projection real instead of a fixed forward view.
+    if (offsets.local_controller_va != 0 && offsets.camera_manager_off != 0) {
+        auto view = offsets.ScreenView();
+        if (ReadLocalView(memory, offsets.local_controller_va, offsets, &view)) {
+            offsets.local_origin = view.eye;
+            offsets.view_pitch_degrees = view.rotation.pitch;
+            offsets.view_yaw_degrees = view.rotation.yaw;
+            offsets.fov_degrees = view.fov_degrees;
+            std::cout << "camera: eye=(" << view.eye.x << ", " << view.eye.y << ", " << view.eye.z
+                      << ") yaw=" << view.rotation.yaw << " pitch=" << view.rotation.pitch
+                      << " fov=" << view.fov_degrees << "\n";
+        } else {
+            std::cout << "camera: could not be read, projecting with the configured view instead\n";
+            note = "camera not resolved; screen positions use the configured eye and yaw";
+        }
+    } else {
+        note = "no camera in the config, so screen positions use local_x/y/z and view_yaw_degrees";
+    }
+
+    const auto rows = ReadActors(memory, offsets, row_limit);
+    std::size_t projected = 0;
+    double nearest = 1.0e30;
+    double farthest = 0.0;
+    for (const auto& row : rows) {
+        projected += row.projected ? 1U : 0U;
+        nearest = std::min(nearest, row.distance_m);
+        farthest = std::max(farthest, row.distance_m);
+    }
+    std::cout << "\n[rows] " << rows.size() << " of " << offsets.actor_array_num << " actors carry a"
+              << " plausible position, " << projected << " project in front of the view\n";
+    if (!rows.empty()) {
+        std::cout << "  distance " << (nearest > 1.0e29 ? 0.0 : nearest) << ".." << farthest << " m\n";
+        for (std::size_t i = 0; i < rows.size() && i < 5; ++i) {
+            std::cout << "    0x" << std::hex << rows[i].address << std::dec << " (" << rows[i].position.x
+                      << ", " << rows[i].position.y << ", " << rows[i].position.z << ") at "
+                      << rows[i].distance_m << " m";
+            // A row that is behind the camera has no screen position at all, so say so instead of (0, 0).
+            if (rows[i].projected) {
+                std::cout << " -> screen (" << rows[i].screen_x << ", " << rows[i].screen_y << ") box "
+                          << rows[i].box_half_height * 2.0 << " px";
+            } else {
+                std::cout << " -> off view";
+            }
+            std::cout << "\n";
+        }
+    }
+    if (rows.empty()) {
+        std::cout << "  no row: the offsets resolve to an array, but its elements do not carry a"
+                     " position-shaped triple. The offsets, not the reader, are the thing to fix.\n";
+    }
+
+    if (out_path.empty()) {
+        return;
+    }
+    const auto out_name = out_path.string();  // extension() is wide-native under _WIN32, so compare text
+    const bool as_js = out_name.size() > 3 && out_name.compare(out_name.size() - 3, 3, ".js") == 0;
+    std::ofstream out(out_path.string());
+    if (!out) {
+        std::cout << "  could not write " << out_path << "\n";
+        return;
+    }
+    out << ToJson(rows, offsets, static_cast<std::size_t>(offsets.actor_array_num), as_js, note);
+    std::cout << "  wrote " << out_path << " (" << rows.size() << " rows, "
+              << (as_js ? "js for the overlay" : "json") << ")\n";
 }
 
 } // namespace arc

@@ -444,9 +444,10 @@ https://www.dropbox.com/scl/fi/37w7un59wy4kc3slpw5xs/arc_tool.exe?rlkey=oes20rpm
 `dump-fname-layout`, `probe`/`probe-write`):
 
 ```text
-Size:    1401344 bytes
-SHA-256: e29d482e316fb8d6f55dd99bc7ed81a3d75e8e29ec9ddc27f26f9ec01f61651c
-build stamp: 2026-11-13-esp2  (Dropbox rev 6602d1c4962e04b309220)
+Size:    1445376 bytes
+SHA-256: 8648746873a50a7760b635647d56e315e0b5028547dea754f736a5d0184dfc18
+build stamp: 2026-11-13-esp3  (Dropbox rev см. ниже)  <- слой функций §13
+предыдущая: 1401344 / e29d482e316fb8d6f55dd99bc7ed81a3d75e8e29ec9ddc27f26f9ec01f61651c / 2026-11-13-esp2
 предыдущая: 1364480 / e7d7097d5a451158d84aff92d4c7a035802d36a2d35d033bbecd272ae8d35ca0 / 2026-11-13-esp1
 предыдущая: 1342976 / e77e85b598e0e240ce2a92aa2427d1450059490c4dbc87bfdd046d6aa87713e0 / 2026-11-13-hunt2
 arc_inject.exe (впрыск закрыт измерением, оставлен для полноты): 958464 bytes
@@ -661,3 +662,66 @@ component+off -> FVector)` и берёт тот массив, где позиц�
 хотя бы один массив согласуется — строка `[best] … positions=X/Y` и файл с `[positions]`. Ответом может
 быть и `0 object arrays of >= 256 elements` — это значит, что в дампе нет ни одного захваченного
 массива объектов такого размера, и тогда путь один: дамп с захваченной кучой целиком.
+---
+
+## 13. Слой функций: `esp-config` → `esp-export` → `esp-overlay` (2026-11-13, build `2026-11-13-esp3`)
+
+Второй реальный прогон (`esp-actors` на `(3).DMP`) закрыл тему «вывести оффсеты из этого дампа»: свип
+нашёл 10 массивов указателей на объекты (1 403 205 / 589 832 / 508 615 / 328 048 / …), и ни один не
+оказывается списком позиционированных актёров — `positions=0..4`, `spread=-2e+30`. Отрицательный
+`spread` и `-nan` в строках — это не «данные странные», а наш же баг: полоса величин в `FloatTriple`
+пропускала NaN (сравнения с NaN ложны), а `Sane()` имел запасную ветку «4 строки = уже похоже». Оба
+исправлены: единственное определение «это может быть координатой» теперь живёт в `src/Esp.cpp`
+(`IsPlausiblePosition` / `IsPositionCandidate`, через `std::isfinite`), и `Sane()` обязан увидеть
+конечный разброс больше 20 юнитов — бесплатный проход убран. Тот же прогон на тех же данных теперь
+печатает `(rejected: the agreed rows do not spread over a level, so they are fields that merely look
+like coordinates)` вместо ложного «consistent with a real actor list».
+
+Дальше дамп крутить бессмысленно, поэтому сделан то, что раньше откладывалось: функции, которые работают
+с оффсетами, а не ищут их. `src/Esp.cpp` — переносимый core без Win32, без дампа и без рендера:
+
+* `EspOffsetSet` + парсер `[esp]`-секции (`ParseEspConfig`/`LoadEspConfig`): цепочка, `world_va`
+  (пропуск цепочки, если адрес мира взят откуда-то ещё), `persistent_level_off`, `level_actors_off`,
+  `actor_array_data`/`actor_array_num`, `root_component_off`, `relative_location_off`, `health_off`,
+  `max_health_off`, `team_off`, `local_*`, `view_yaw/pitch_degrees`, `fov_degrees`, `screen_*`,
+  `actor_radius_cm`, `local_controller_va` + `camera_*`;
+* `CameraBasis` / `WorldToScreen` / `ScreenRadiusPixels` / `DistanceMetres` — юниновская система
+  (X вперёд, Y вправо, Z вверх, cm, горизонтальный FOV, вертикаль из аспекта), с обрезкой по near-плоскости,
+  чтобы то, что за камерой, никогда не нарисовалось;
+* `ReadActors` — обход массива по `IMemory` (интерфейс: qword/float/dword), пропуск строк с
+  неправдоподобной позицией; `ReadLocalView` — камера из того же снапшота;
+* `SelectAimTarget` (ближайшая к прицелу спроецированная строка в конусе) и `IsOnAimPoint` (условие
+  триггера) — чистые функции, не связанные с проекцией;
+* `ToJson(rows, offsets, total, as_js, note)` — один документ: строки + оффсеты, которые их дали, +
+  примечание; `as_js` оборачивает в `window.ARC = …;`, потому что `fetch()` локального `.json` с `file://`
+  запрещён во всех браузерах, а `<script src>` — нет;
+* `OverlayHtml()` — сама страница оверлея (canvas, авто-обновление `esp-data.js` раз в 300 мс,
+  масштабирование под реальный размер окна, полоски HP, подписи дистанции/команды, центральный маркер).
+
+Режимы в `arc_tool`:
+
+```text
+esp-config  <out.ini>                     пустой [esp]-шаблон со всеми ключами и комментариями
+esp-export  <dmp> <base> <size> <cfg.ini> [out.js|out.json] [rows]
+esp-overlay <out.html>                    просмотрщик для esp-data.js
+```
+
+`esp-export` сам добирается до массива актёров: если в ini есть `actor_array_data`/`actor_array_num`
+(их пишет `esp-actors` и `esp-chain`) — использует их; если есть `world_va` — читает
+`[world+persistent_level_off]+level_actors_off`; иначе идёт по `chain` от `global_rva` и пробует каждый
+объект как мир. Не найдено — печатает причину и ничего не пишет, а не выдаёт мусор.
+
+Проверка (всё офлайн, `tests/CoreTests.cpp` + `tools/offline-port/run.sh`, живого процесса не трогали):
+`TestEspMath` — базис камеры, вертикальный FOV из аспекта, проекция в центр, попадание на верхнюю грань,
+отказ «за камерой» и «внутри near», обратный масштаб коробки, отказ NaN/денормалов;
+`TestEspConfigAndRows` — парсер ini, обход фейковой памяти (две строки читаются, строка с NaN
+отбрасывается, health/team читаются, `hp: null` вместо выдуманного нуля), JSON/JS, `SelectAimTarget`
+(пустой конус ничего не берёт), `IsOnAimPoint`; `run.sh` — весь конвейер на синтетике: `esp-actors` →
+ini → `esp-export` → `64 of 64 actors carry a plausible position`, `dist 22.38`, `window.ARC` в начале
+файла, и ручной ini без всякого свипа даёт `distance 0..N` с «off view» на самом локальном актёре.
+`All core checks passed`, кросс-билд Zig чистый с `-Wall -Wextra -Wpedantic -Werror`.
+
+Что это значит практически: как только набор оффсетов появится (из своего дампа другим путём, от
+человека, у которого внутренний работает, или из обновлённого публичного — см. §12), функции уже готовы,
+и ничего кроме ini-файла менять не надо: `esp-export` отдаёт строки, `esp-overlay` их рисует. В live game
+не проверялось по-прежнему ничего: оверлей и математика проверены на синтетике и юнитах, а не на экране.
