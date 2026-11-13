@@ -46,6 +46,10 @@ private:
 // and whether the module list is reachable through the PEB when Toolhelp enumeration fails.
 void PrintProcessProbe(std::uint32_t pid);
 
+// Reads a window of the live process and prints what the bytes say about the FName entry layout
+// (see arc::PrintNameLayout). Same measurement as `dump-fname-layout`, applied to running memory.
+void PrintProcessFNameLayout(std::uint32_t pid, std::uint64_t va, std::uint32_t window, std::size_t max_hits);
+
 [[nodiscard]] std::string WideToUtf8(std::wstring_view value);
 [[nodiscard]] std::wstring Utf8ToWide(std::string_view value);
 [[nodiscard]] std::uint32_t ReadPeTimestamp(const Process& process, const ModuleInfo& module);

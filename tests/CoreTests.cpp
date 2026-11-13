@@ -346,6 +346,50 @@ void TestNameBlockChain() {
 }
 
 
+// One entry with a fixed tail after the string: the strict chained walk stops after the first entry,
+// while the local predicate still finds every name and the gap histogram shows the real stride.
+void PutNameEntryWithTail(std::vector<std::uint8_t>& bytes, std::string_view name, std::size_t tail) {
+    const auto start = bytes.size();
+    bytes.resize(start + 2);
+    PutU16At(bytes, start, static_cast<std::uint16_t>(name.size() << 6));
+    bytes.insert(bytes.end(), name.begin(), name.end());
+    bytes.push_back(0);
+    if (bytes.size() % 2 != 0) {
+        bytes.push_back(0);
+    }
+    bytes.resize(bytes.size() + tail, 0xAA);
+}
+
+void TestNameLayoutProbe() {
+    std::vector<std::uint8_t> block;
+    for (const auto* name : {"None", "World", "Actor", "Pawn"}) {
+        PutNameEntryWithTail(block, name, 8);
+    }
+    block.resize(0x20000, 0);
+    const auto strict = arc::WalkNameBlock(block, arc::kNameCodecMeasured, 64);
+    Check(strict.entries.size() == 1, "chained walk tolerated a tail between entries");
+
+    const auto hits = arc::FindNameLikeEntries(block, arc::kNameCodecMeasured, 512);
+    Check(hits.size() == 4, "local predicate missed entries");
+    Check(hits[0].text == "None" && hits[3].text == "Pawn", "local predicate text");
+    Check(hits[1].offset - hits[0].offset == 0x10, "entry stride");
+    const auto gaps = arc::GapHistogram(hits);
+    Check(gaps.size() == 1 && gaps[0].first == 0x10 && gaps[0].second == 3, "gap histogram");
+
+    // Wide entries are reported as wide, and the header word is available for the caller to print.
+    std::vector<std::uint8_t> wide(0x40, 0);
+    PutU16At(wide, 0, static_cast<std::uint16_t>((4 << 6) | 1));
+    const char16_t text[4] = {u'N', u'o', u'n', u'e'};
+    for (std::size_t i = 0; i < 4; ++i) {
+        PutU16At(wide, 2 + i * 2, static_cast<std::uint16_t>(text[i]));
+    }
+    const auto wide_hits = arc::FindNameLikeEntries(wide, arc::kNameCodecMeasured, 8);
+    Check(wide_hits.size() == 1 && wide_hits[0].wide && wide_hits[0].text == "None", "wide hit decode");
+    Check(arc::GapHistogram(wide_hits).empty(), "gap histogram with a single hit");
+    Check(arc::FindNameLikeEntries(std::span<const std::uint8_t>{}, arc::kNameCodecMeasured, 8).empty(),
+        "empty window produced hits");
+}
+
 void TestViewportDecrypt() {
     std::array<std::uint8_t, 0x100> bank{};
     const std::uint64_t lo = 0xF7149774B727E060ULL, hi = 0x642BFE20256AF201ULL;
@@ -371,6 +415,7 @@ int main() {
         TestUsmap();
         TestNameEntries();
         TestNameBlockChain();
+        TestNameLayoutProbe();
         TestViewportDecrypt();
         std::cout << "All core checks passed\n";
         return 0;

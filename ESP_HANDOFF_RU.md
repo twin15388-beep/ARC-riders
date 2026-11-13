@@ -178,58 +178,62 @@ Object + 0x18 = 0
 - health/team/bones;
 - GameViewportClient.
 
-## 6. FNamePool recovery — актуальный шаг (2026-11-13)
+## 6. FNamePool recovery — актуальный шаг (2026-11-13, после двух прогонов)
 
-`dump-fname-pool` с маршрута снят: его предикат не мог дать `PREDICATE PASS`. Он требовал одновременно
-(а) `block = entry & ~0x1FFFF`, то есть блок, выровненный по 0x20000; (б) непрерывный прогон минимум из
-8 указателей, каждый из которых ведёт в блок, содержащий одно из 10 имён; (в) чтобы указатель на
-`Chunks[]` лежал в heap, а не в образе. В UE5 блоки — отдельные аллокации, связанные через
-`FBlockInfo::Next`, а имена ядра движка сосредоточены в первых блоках, поэтому такого прогона не
-существует даже при полностью рабочем пуле. `validated_pools=0` из этого скана — не факт про игру.
+Оба запуска, которые я просил, сделаны, и каждый дал измеренный факт.
 
-Новая команда:
+`dump-fname-blocks` на реальном дампе (`C:\Users\Malin\AppData\Local\Temp\PioneerGame (3).DMP`,
+12 956 266 993 байта):
 
 ```text
-dump-fname-blocks <DMP> <ImageBase> <ImageSize> [block0_VA] [block_size] [min_entries] [max_blocks]
+build=2026-11-13-fname-blocks-probe
+block_size=0x20000 min_entries=64 expected_first="None" captured_ranges=63459
+discovery scanned_bytes=12943527936 marker_hits=1140 region_probes=1004 anchors=0
+SUMMARY build=2026-11-13-fname-blocks-probe anchors=0 validated_pools=0
 ```
 
-- стартует от строки `None` и принимает блок только если поток записей декодируется плотно
-  (`min_entries`, по умолчанию 64); выравнивание блока не предполагается;
-- размер заголовка блока не предполагается: из кандидатов `0x8..0x30` берётся тот, у которого `Next`
-  ведёт в ещё один декодируемый блок, и он же печатается в отчёте;
-- затем обходится вся цепочка блоков (это и есть имена), отдельно пробуется форма «блоки идут подряд
-  через `block_size`» — `stride_blocks`;
-- печатается `bytes_before_block` — 0x40 raw-байт перед блоком, чтобы макет заголовка читался глазами,
-  а не выводился из догадки;
-- печатаются pool-индексы нужных ESP имён: `(block << 16) | entry_offset / 2`;
-- в конце — все указатели дампа на эти блоки: `[image] RVA=...` это кандидат `GNames`, стабильный между
-  запусками, `[heap]` годится только внутри этого дампа.
+Значит: маркеров `None\0` в памяти много (1140), но ни одна из двух кодировок заголовка записи, которые
+я вносил в `Names.h` (`measured_shift6_wide0_str2`, `alt_len_bits_0_9_wide10`), не разворачивает оттуда
+плотный поток за `min_entries=64`. Это вывод про мои две догадки, а не про то, что пула нет. Третьу догадку
+я добавлять не буду — layout надо снимать с байтов.
 
-Кодировка заголовка записи тоже измеряется: в `Names.h` две кандидаты —
-`measured_shift6_wide0_str2` (измерено на блоке `0xA6A00000` dump `(2)`) и `alt_len_bits_0_9_wide10`, и
-отчёт пишет, какая из них реально декодировала блок.
+`probe 14292` на живом процессе: `current_process_elevated=yes`, `se_debug_privilege=enabled`, все восемь
+прав выданы, `reader_handle=open`, `vm_read_at_image_base=MZ ok`, `private_region_reads=5 of 5`,
+`toolhelp_snapshot=ok modules=77`. Внешнее пользовательское чтение работает полностью — architecture
+решена в пользу external reader + overlay, старый `VirtualAllocEx error 5` больше не аргумент.
+`live image_base=0x7ff7e6370000` (ASLR) против дамп-базы `0x140000000`, так что любое число из дампа
+пересчитывается через живую базу. Обход PEB в той сборке был мой баг (печатал 2 модуля и `ntdll.dll
+base=0x1c9e14cc3d0`), а `PioneerGame.exe size=0x1d82000` из LDR-записи противоречит PE-заголовку дампа
+(`0x139F9000`) — поэтому размер образа больше не берётся из LDR.
+
+Что добавлено в инструмент вместо новой догадки:
+
+- `dump-fname-blocks` при нуле якорей ранжирует просмотренные области по плотности строк и печатает для
+  топ-8: число ASCII-пробегов, байтовый шаг между соседними строками, первое имя и 0x40 raw-байт. Единый
+  шаг = фиксированный stride записей; чередующиеся шаги = лишние поля в записи; заголовок виден глазами.
+- `dump-fname-layout <DMP> <VA> [window] [max_hits]` и `live-fname-layout <pid> <VA> [window] [max_hits]`
+  применяют то же измерение к любому адресу — в дампе и в живой памяти, через один и тот же
+  `arc::PrintNameLayout`. Он печатает и имя, и 16-битное слово прямо перед началом строки, то есть поле
+  длины/ширины видно без предположения о сдвиге.
+- `probe` теперь сверяет обход PEB с Toolhelp (`peb_walk validation: modules=N bases_also_in_toolhelp=K`) и
+  печатает `live_pe_headers ... SizeOfImage`, секции и `last_page_readable` из самого образа в памяти.
+  Расхождение с Toolhelp — сигнал «offsetы записи неверны, доверяй Toolhelp».
 
 ```powershell
-.\arc_tool.exe version    # жду build=2026-11-13-fname-blocks-probe
+.\arc_tool.exe version    # жду build=2026-11-13-layout-probe
 .\arc_tool.exe dump-fname-blocks "C:\Users\Malin\AppData\Local\Temp\PioneerGame (3).DMP" 0x140000000 0x139F9000
+.\arc_tool.exe probe <pid>
 ```
 
-EXE в Dropbox: `/arc_tool.exe`, rev `660263c4bcaa54b309220`, размер `1,190,912`, SHA-256
-`3a7892ba226b7cb5d79e6eeba5e255fc0971425335519d39ab7a99421b23174e` (загружено 2026-11-13). В репозитории
-тот же файл лежит как `out/arc_tool.exe`, сам `out/` в git не попадает.
+EXE в Dropbox: `/arc_tool.exe`, rev `660263c4bcaa54b309220` (заменён на сборку
+`2026-11-13-layout-probe`, размер `1,245,184`, SHA-256
+`17ed9f27a15d91762c6fdd82626e382cbcdca77af81d2e64f8b610f492fa17c1`). В репозитории тот же файл —
+`out/arc_tool.exe`, сам `out/` в git не попадает.
 
-Проверено на синтетическом MDMP (три блока, данные НЕ выровнены по 0x20000, указатель на заголовок
-нулевого блока внутри образа): якорь найден, заголовок `0x10` определён probing-ом, цепочка
-`blocks=3 names=210`, referrer `[image] RVA=0x100`, `PREDICATE PASS`. На реальном дампе команда ещё не
-запускалась.
-
-Добавлен `probe <pid>` — доступ к живому процессу как измеряемый факт: исход по одному `OpenProcess` на
-каждое право, состояние токена (elevation, `SeDebugPrivilege`), список модулей через
-`NtQueryInformationProcess` + PEB без Toolhelp, проверка `MZ` в `PEB.ImageBaseAddress` и до пяти чтений
-приватных committed-областей. Интерпретация — как в старом `README-RUN.md` в Dropbox: `OpenProcess`
-может вернуть хэндл с уже срезанным `PROCESS_VM_READ` (callback защиты), поэтому решает попытка чтения,
-а не успешный `OpenProcess`. Относительный external-vs-internal вывод `probe` ещё не давал: он не
-запускался на live-процессе.
+Проверено на синтетических MDMP: плотный дамп по-прежнему даёт `PREDICATE PASS blocks=3 names=210`
+(регрессии нет), а дамп с 8-байтовым «хвостом» в записи, где строгий обход ломается, даёт
+`ascii_run ... runs=64 string_to_string=0x16x63` + `partial ... gaps=0x10x63` — то есть инструмент честно
+показывает реальный шаг вместо тихого `anchors=0`. В live game ничего не запускалось.
 
 ## 7. Constructor lead, если FNamePool predicate не пройден
 
@@ -365,12 +369,12 @@ ImGui menu можно писать независимо, но оно не дас
 
 https://www.dropbox.com/scl/fi/37w7un59wy4kc3slpw5xs/arc_tool.exe?rlkey=oes20rpmsq1wm7zkvcljap17e&dl=0
 
-Актуальная версия (2026-11-13, `dump-fname-blocks` + `probe` + `version`):
+Актуальная версия (2026-11-13, `dump-fname-blocks` + `dump-fname-layout` + `live-fname-layout` + `probe`):
 
 ```text
-Size:    1190912 bytes
-SHA-256: 3a7892ba226b7cb5d79e6eeba5e255fc0971425335519d39ab7a99421b23174e
-build stamp: 2026-11-13-fname-blocks-probe
+Size:    1245184 bytes
+SHA-256: 17ed9f27a15d91762c6fdd82626e382cbcdca77af81d2e64f8b610f492fa17c1
+build stamp: 2026-11-13-layout-probe
 ```
 
 Build выполнен Zig `x86_64-windows-gnu`, C++20, static, strict `-Werror`, exit code `0`. Portable core tests прошли. FNamePool scan на реальном dump ещё не запускался из-за запуска пользователем старого EXE. Ничего не проверено в live game.

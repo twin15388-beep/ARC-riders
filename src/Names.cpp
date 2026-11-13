@@ -1,6 +1,10 @@
 #include "Names.h"
 
 #include <algorithm>
+#include <iomanip>
+#include <ostream>
+#include <span>
+#include <vector>
 #include <cstring>
 #include <limits>
 
@@ -179,6 +183,193 @@ NameBlockWalk DetectNameBlock(
         }
     }
     return best;
+}
+
+std::vector<NameHit> FindNameLikeEntries(
+    const std::span<const std::uint8_t> window,
+    const NameCodec& codec,
+    const std::size_t max_hits) {
+    std::vector<NameHit> hits;
+    if (codec.string_offset < kHeaderBytes || codec.length_bits == 0 || codec.length_bits > 16 ||
+        codec.length_shift + codec.length_bits > 16) {
+        return hits;
+    }
+    const std::uint32_t mask = (1U << codec.length_bits) - 1U;
+    std::size_t position = codec.string_offset;
+    while (position + 1 < window.size() && hits.size() < max_hits) {
+        const auto entry = static_cast<std::uint32_t>(position - codec.string_offset);
+        const auto header = LoadU16(window.data() + entry);
+        const auto length = (header >> codec.length_shift) & mask;
+        const bool wide = ((header >> codec.wide_bit) & 1U) != 0;
+        const std::uint32_t char_width = wide ? 2U : 1U;
+        const std::uint64_t payload = static_cast<std::uint64_t>(length + 1U) * char_width;
+        bool accepted = length >= 1 && length <= kMaxNameLength &&
+            payload <= window.size() - position;
+        if (accepted) {
+            const auto* text = window.data() + position;
+            for (std::uint32_t i = 0; i < length && accepted; ++i) {
+                accepted = wide ? IsWideNameCharacter(LoadU16(text + i * 2))
+                               : IsNameCharacter(static_cast<char>(text[i]));
+            }
+            if (accepted) {
+                accepted = wide ? LoadU16(text + length * 2) == 0 : text[length] == 0;
+            }
+        }
+        if (accepted) {
+            NameHit hit;
+            hit.offset = entry;
+            hit.length = length;
+            hit.wide = wide;
+            const auto* text = window.data() + position;
+            for (std::uint32_t i = 0; i < length; ++i) {
+                const auto code = wide ? LoadU16(text + i * 2) : text[i];
+                AppendUtf8(hit.text, code);
+            }
+            hits.push_back(std::move(hit));
+            position += static_cast<std::size_t>(payload);
+            position += position & 1U;
+        } else {
+            position += 2;
+        }
+    }
+    return hits;
+}
+
+std::vector<NameHit> FindAsciiRuns(
+    const std::span<const std::uint8_t> window,
+    const std::uint32_t min_length,
+    const std::size_t max_hits) {
+    std::vector<NameHit> hits;
+    std::size_t position = 0;
+    while (position < window.size() && hits.size() < max_hits) {
+        if (!IsNameCharacter(static_cast<char>(window[position]))) {
+            ++position;
+            continue;
+        }
+        std::size_t end = position;
+        while (end < window.size() && IsNameCharacter(static_cast<char>(window[end]))) {
+            ++end;
+        }
+        // Only a NUL right after the run makes it a string, as opposed to random printable bytes.
+        if (end < window.size() && window[end] == 0 && end - position >= min_length &&
+            end - position <= kMaxNameLength) {
+            NameHit hit;
+            hit.offset = static_cast<std::uint32_t>(position);
+            hit.length = static_cast<std::uint32_t>(end - position);
+            hit.text.assign(reinterpret_cast<const char*>(window.data() + position), hit.length);
+            hits.push_back(std::move(hit));
+        }
+        position = end + 1;
+    }
+    return hits;
+}
+
+std::vector<std::pair<std::uint32_t, std::uint32_t>> GapHistogram(const std::span<const NameHit> hits) {
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> histogram;
+    for (std::size_t i = 1; i < hits.size(); ++i) {
+        if (hits[i].offset <= hits[i - 1].offset) {
+            continue;
+        }
+        const auto gap = hits[i].offset - hits[i - 1].offset;
+        const auto found = std::find_if(histogram.begin(), histogram.end(),
+            [gap](const std::pair<std::uint32_t, std::uint32_t>& entry) { return entry.first == gap; });
+        if (found == histogram.end()) {
+            histogram.emplace_back(gap, 1U);
+        } else {
+            ++found->second;
+        }
+    }
+    std::sort(histogram.begin(), histogram.end(),
+        [](const std::pair<std::uint32_t, std::uint32_t>& left,
+           const std::pair<std::uint32_t, std::uint32_t>& right) {
+            return left.second != right.second ? left.second > right.second : left.first < right.first;
+        });
+    return histogram;
+}
+
+namespace {
+
+std::uint16_t PeekU16(const std::span<const std::uint8_t>& bytes, std::size_t position) noexcept {
+    return position + 1 < bytes.size() ? LoadU16(bytes.data() + position) : 0;
+}
+
+std::vector<std::uint8_t> ReadWindow(const CapturedRead& read, const std::uint64_t va, const std::uint32_t size) {
+    const auto view = read(va, size);
+    if (!view) {
+        return {};
+    }
+    // The view is only guaranteed valid until the next call, so copy it out.
+    return {view->begin(), view->end()};
+}
+
+void PrintRawBytes(std::ostream& out, std::string_view indent, std::span<const std::uint8_t> bytes) {
+    for (std::size_t offset = 0; offset < bytes.size(); offset += 16) {
+        out << indent << "+0x" << std::hex << std::setw(4) << std::setfill('0') << offset << std::dec
+            << std::setfill(' ') << ":";
+        std::string ascii;
+        for (std::size_t i = 0; i < 16 && offset + i < bytes.size(); ++i) {
+            const auto byte = bytes[offset + i];
+            out << ' ' << std::hex << std::setw(2) << std::setfill('0') << static_cast<std::uint32_t>(byte)
+                << std::dec << std::setfill(' ');
+            ascii.push_back(byte >= 0x20 && byte <= 0x7e ? static_cast<char>(byte) : '.');
+        }
+        out << "  " << ascii << '\n';
+    }
+}
+
+} // namespace
+
+void PrintNameLayout(
+    std::ostream& out,
+    const std::string_view label,
+    const CapturedRead& read,
+    const std::uint64_t va,
+    const std::uint32_t window,
+    const std::size_t max_hits) {
+    if (window < 0x40 || window > 0x100000) {
+        out << label << ": window must be 0x40..0x100000\n";
+        return;
+    }
+    if (max_hits == 0 || max_hits > 4096) {
+        out << label << ": max_hits must be 1..4096\n";
+        return;
+    }
+    const auto bytes = ReadWindow(read, va, window);
+    out << label << ": region=0x" << std::hex << va << " window=0x" << window << std::dec << '\n';
+    for (const auto& codec : kNameCodecCandidates) {
+        const auto hits = FindNameLikeEntries(bytes, codec, max_hits);
+        out << "  codec=" << codec.label << " name_like=" << hits.size() << " gaps=";
+        const auto gaps = GapHistogram(hits);
+        for (std::size_t i = 0; i < gaps.size() && i < 8; ++i) {
+            out << (i == 0 ? "" : ",") << "0x" << std::hex << gaps[i].first << std::dec << "x"
+                << gaps[i].second;
+        }
+        out << '\n';
+        for (std::size_t i = 0; i < hits.size() && i < 48; ++i) {
+            out << "    [" << i << "] entry=0x" << std::hex << hits[i].offset << " header=0x"
+                << PeekU16(bytes, hits[i].offset) << " len=" << hits[i].length
+                << (hits[i].wide ? " wide" : " ansi") << " \"" << hits[i].text << "\"" << std::dec
+                << '\n';
+        }
+    }
+    const auto runs = FindAsciiRuns(bytes, 3, max_hits);
+    out << "  ascii_runs (independent of the header format): " << runs.size() << " string_to_string=";
+    const auto run_gaps = GapHistogram(runs);
+    for (std::size_t i = 0; i < run_gaps.size() && i < 8; ++i) {
+        out << (i == 0 ? "" : ",") << "0x" << std::hex << run_gaps[i].first << std::dec << "x"
+            << run_gaps[i].second;
+    }
+    out << '\n';
+    for (std::size_t i = 0; i < runs.size() && i < 32; ++i) {
+        const auto string_start = runs[i].offset;
+        const auto back_off = string_start >= 2 ? string_start - 2 : string_start;
+        out << "    [" << i << "] string=0x" << std::hex << string_start << " len=" << runs[i].length
+            << " u16_before=0x" << PeekU16(bytes, back_off) << " \"" << runs[i].text << "\"" << std::dec
+            << '\n';
+    }
+    out << "  raw bytes:\n";
+    const std::span<const std::uint8_t> view{bytes};
+    PrintRawBytes(out, "    ", view.size() > 0x400 ? view.first(0x400) : view);
 }
 
 std::vector<HeaderProbe> ProbeBlockHeaders(

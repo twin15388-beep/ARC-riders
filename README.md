@@ -69,6 +69,26 @@ one of ten names) and is superseded: that conjunction cannot pass on a UE5 block
 
 Entry-header encoding is chosen by measurement. `Names.h` carries two candidate codecs; the report
 names the one that actually decoded the block, so the encoding is a result rather than an assumption.
+Neither codec decoded this build: on `PioneerGame (3).DMP` the report was
+`marker_hits=1140 region_probes=1004 anchors=0`, so no candidate `None`-anchored block reached
+`min_entries=64`. That is a statement about the codecs, not about the pool being absent, so the run now
+also prints what the bytes do say (below) instead of stopping at a failed hypothesis.
+
+### Measuring the FName entry layout
+
+When the strict walk is rejected, the same discovery pass ranks the examined regions by string density
+and prints, for the top eight: the number of printable runs, the byte gap between consecutive strings,
+the first string, and 64 raw bytes. A single dominant gap means a fixed entry stride; alternating gaps
+mean extra per-entry fields; the raw bytes show the header word next to the text. `dump-fname-layout`
+applies the identical measurement to any address, in a dump or in the live process
+(`live-fname-layout`), and is deliberately independent of the header encoding: it lists ASCII runs, the
+16-bit word immediately before each one, and the hex dump, which is enough to read the entry header off
+the data rather than pick it from a table.
+
+```powershell
+.\arc_tool.exe dump-fname-layout $d 0x20000100 0x400 512
+.\arc_tool.exe live-fname-layout <pid> 0x7ff677700000 0x400 512
+```
 
 ### Access probe for a live process
 
@@ -76,7 +96,15 @@ A handle can be granted with `PROCESS_VM_READ` silently stripped, so the decisiv
 read succeeds, not whether `OpenProcess` returned. `probe` prints the per-rights result, the token's
 elevation and `SeDebugPrivilege` state, the module list recovered through `NtQueryInformationProcess`
 and the PEB (no Toolhelp), the MZ check at the image base, and reads of up to five private committed
-regions.
+regions. The PEB walk is cross-checked against Toolhelp and reported as
+`peb_walk validation: modules=N bases_also_in_toolhelp=K`, because a walk shifted by one list offset
+still prints plausible-looking first entries; a disagreement tells you to trust Toolhelp. Module sizes
+are additionally measured from the image's own headers in memory (`live_pe_headers ... SizeOfImage`),
+since a size read out of an `LDR_DATA_TABLE_ENTRY` disagreed with the dump's PE header on this build.
+
+On the observed run (`probe 14292`) every right was granted, `SeDebugPrivilege` was enabled, the MZ
+check passed, and `private_region_reads=5 of 5`: external user-mode reads work against this build, and
+the module list is reachable through Toolhelp (77 modules).
 
 ```powershell
 .\arc_tool.exe probe <pid>
@@ -111,7 +139,7 @@ $d = "$env:USERPROFILE\AppData\Local\Temp\PioneerGame.DMP"
 
 - Build-verified: Windows AMD64 PE cross-compilation with LLVM/MinGW, warnings as errors.
 - Isolated checks: portable core tests plus ASan/UBSan; the supplied 5.4 MB `.usmap` parses completely.
-- Not established: exact global `FNamePool`, `GUObjectArray`, `GWorld`, decryption routines, byte offsets, generated SDK, ESP, or any in-game behavior. `dump-fname-blocks` was verified end to end against a synthetic MDMP (three chained blocks, unaligned block data, in-image referrer) built for that purpose; it has not been run against a game dump yet.
+- Not established: exact global `FNamePool`, `GUObjectArray`, `GWorld`, decryption routines, byte offsets, generated SDK, ESP, or any in-game behavior. `dump-fname-blocks` was verified end to end against a synthetic MDMP (three chained blocks, unaligned block data, in-image referrer) built for that purpose, and run against the real 12.95 GB game dump, where both shipped codecs failed to anchor a block (`anchors=0`) — the layout must still be measured. No ESP, aim, or in-game behavior has been run at all.
 - Public candidate `base+0x109BB1C0` is rejected for the supplied dump because its first pointer is zero. Other public candidates remain unvalidated until their pointed data and decryption are checked.
 
 ## Build-specific viewport candidate

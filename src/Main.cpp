@@ -38,6 +38,8 @@ void Usage() {
         << "arc_tool dump-rip-xrefs <game.dmp> <VA>  Find RIP-relative LEA references\n"
         << "arc_tool dump-fname-pool <game.dmp> <base> <image_size>  Superseded shape scan\n"
         << "arc_tool dump-fname-blocks <game.dmp> <base> <image_size> [block0_VA] [block_size] [min_entries] [max_blocks]  Recover the FName pool from a decodable block\n"
+        << "arc_tool dump-fname-layout <game.dmp> <VA> [window] [max_hits]  Measure the entry layout of a region\n"
+        << "arc_tool live-fname-layout <pid> <VA> [window] [max_hits]  Measure the entry layout of live process memory\n"
         << "arc_tool probe <pid>                     Report which process rights are granted\n"
         << "arc_tool version                          Print the embedded build stamp\n"
         << "arc_tool dump-scan <game.dmp> <AOB>      Find an AOB pattern in captured memory\n"
@@ -210,6 +212,26 @@ int main(int argc, char** argv) {
         }
         if (argc == 5 && std::string_view(argv[1]) == "dump-fname-pool") {
             arc::PrintDumpFNamePool(argv[2], arc::ParseUnsigned(argv[3]), arc::ParseUnsigned(argv[4]));
+            return 0;
+        }
+        if (argc >= 4 && std::string_view(argv[1]) == "live-fname-layout") {
+            const auto window = argc >= 5 ? arc::ParseUnsigned(argv[4]) : 0x4000;
+            const auto max_hits = argc >= 6 ? arc::ParseUnsigned(argv[5]) : 512;
+            if (window > UINT32_MAX) {
+                throw std::invalid_argument("window must fit uint32");
+            }
+            arc::PrintProcessFNameLayout(ParsePid(argv[2]), arc::ParseUnsigned(argv[3]),
+                static_cast<std::uint32_t>(window), static_cast<std::size_t>(max_hits));
+            return 0;
+        }
+        if (argc >= 4 && std::string_view(argv[1]) == "dump-fname-layout") {
+            const auto window = argc >= 5 ? arc::ParseUnsigned(argv[4]) : 0x4000;
+            const auto max_hits = argc >= 6 ? arc::ParseUnsigned(argv[5]) : 512;
+            if (window > UINT32_MAX || max_hits > SIZE_MAX) {
+                throw std::invalid_argument("window must fit uint32 and max_hits size_t");
+            }
+            arc::PrintDumpFNameLayout(argv[2], arc::ParseUnsigned(argv[3]),
+                static_cast<std::uint32_t>(window), static_cast<std::size_t>(max_hits));
             return 0;
         }
         if (argc >= 5 && std::string_view(argv[1]) == "dump-fname-blocks") {

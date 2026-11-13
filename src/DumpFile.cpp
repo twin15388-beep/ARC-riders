@@ -1098,6 +1098,21 @@ void PrintHexWindow(std::string_view label, const std::optional<std::span<const 
     std::cout << " (" << data->size() << " bytes)\n";
 }
 
+struct RunHit {
+    std::uint64_t base{};
+    std::uint32_t runs{};
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> gaps;
+    std::string first_text;
+    std::vector<std::uint8_t> head;
+};
+
+struct PartialHit {
+    std::uint64_t base{};
+    std::uint32_t name_like{};
+    std::vector<NameHit> hits;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> gaps;
+};
+
 struct AnchorHit {
     std::uint64_t data_va{};      // first FName entry of the block
     const NameCodec* codec{};
@@ -1159,6 +1174,10 @@ void PrintDumpFNameBlocks(
               << "\" captured_ranges=" << ranges.size() << '\n';
 
     std::vector<AnchorHit> anchors;
+    std::vector<PartialHit> partials;  // best decoders that missed the strict gate, for layout reading
+    std::vector<RunHit> run_hits;      // header-format independent candidates, ranked by string density
+    constexpr std::size_t max_partials = 8;
+    constexpr std::uint32_t layout_window = 0x400;
     std::set<std::uint64_t> seen_bases;
     std::uint64_t scanned_bytes = 0;
     std::uint64_t marker_hits = 0;
@@ -1227,6 +1246,58 @@ void PrintDumpFNameBlocks(
                     const auto walk = WalkNameBlock(*block, codec, entry_cap);
                     if (walk.entries.empty() || walk.entries.front().text != kExpectedFirst ||
                         walk.entries.size() < min_entries) {
+                        const std::size_t span = std::min<std::size_t>(layout_window, block->size());
+                        auto hits = FindAsciiRuns(block->first(span), 3, 512);
+                        if (hits.size() >= 8) {
+                            RunHit candidate;
+                            candidate.base = base;
+                            candidate.runs = static_cast<std::uint32_t>(hits.size());
+                            candidate.gaps = GapHistogram(hits);
+                            candidate.first_text = hits.front().text;
+                            const auto head_span = std::min<std::size_t>(0x40, block->size());
+                            candidate.head.assign(block->begin(), block->begin() + head_span);
+                            const auto place = std::find_if(run_hits.begin(), run_hits.end(),
+                                [&candidate](const RunHit& other) { return other.base == candidate.base; });
+                            if (place == run_hits.end()) {
+                                run_hits.push_back(std::move(candidate));
+                            } else if (candidate.runs > place->runs) {
+                                *place = std::move(candidate);
+                            }
+                            std::sort(run_hits.begin(), run_hits.end(),
+                                [](const RunHit& left, const RunHit& right) { return left.runs > right.runs; });
+                            if (run_hits.size() > max_partials) {
+                                run_hits.pop_back();
+                            }
+                        }
+                        hits = FindNameLikeEntries(block->first(span), kNameCodecMeasured, 512);
+                        if (hits.size() >= 4) {
+                            PartialHit partial;
+                            partial.base = base;
+                            partial.name_like = static_cast<std::uint32_t>(hits.size());
+                            partial.gaps = GapHistogram(hits);
+                            if (hits.size() > 12) {
+                                hits.resize(12);
+                            }
+                            partial.hits = std::move(hits);
+                            const auto place = std::find_if(partials.begin(), partials.end(),
+                                [&partial](const PartialHit& other) { return other.base == partial.base; });
+                            if (place == partials.end()) {
+                                partials.push_back(std::move(partial));
+                                std::sort(partials.begin(), partials.end(),
+                                    [](const PartialHit& left, const PartialHit& right) {
+                                        return left.name_like > right.name_like;
+                                    });
+                                if (partials.size() > max_partials) {
+                                    partials.pop_back();
+                                }
+                            } else if (partial.name_like > place->name_like) {
+                                *place = std::move(partial);
+                                std::sort(partials.begin(), partials.end(),
+                                    [](const PartialHit& left, const PartialHit& right) {
+                                        return left.name_like > right.name_like;
+                                    });
+                            }
+                        }
                         continue;
                     }
                     AnchorHit anchor{
@@ -1271,6 +1342,32 @@ void PrintDumpFNameBlocks(
         }
     }
     if (anchors.empty()) {
+        for (const auto& run : run_hits) {
+            std::cout << "  ascii_run block_base=0x" << std::hex << run.base << std::dec << " runs="
+                      << run.runs << " string_to_string=";
+            for (std::size_t i = 0; i < run.gaps.size() && i < 4; ++i) {
+                std::cout << (i == 0 ? "0x" : ",0x") << run.gaps[i].first << "x" << run.gaps[i].second;
+            }
+            std::cout << " first=\"" << run.first_text << "\"\n";
+            PrintHexWindow("    head", std::span<const std::uint8_t>(run.head));
+        }
+        std::cout << "\nlayout of the best " << partials.size()
+                  << " regions (strict walk rejected, so the entry stride differs from the model):\n";
+        for (const auto& partial : partials) {
+            std::cout << "  partial block_base=0x" << std::hex << partial.base << std::dec
+                      << " name_like_entries=" << partial.name_like << " gaps=";
+            for (std::size_t i = 0; i < partial.gaps.size() && i < 6; ++i) {
+                std::cout << (i == 0 ? "" : ",") << "0x" << std::hex << partial.gaps[i].first << std::dec
+                          << "x" << partial.gaps[i].second;
+            }
+            std::cout << "\n";
+            for (const auto& hit : partial.hits) {
+                std::cout << "    entry=0x" << std::hex << hit.offset << std::dec << " len=" << hit.length
+                          << (hit.wide ? " wide" : " ansi") << " \"" << hit.text << "\"\n";
+            }
+        }
+        std::cout << "  read one of these regions in full with: dump-fname-layout <dmp> <block_base> "
+                  << layout_window << " 512\n";
         std::cout << "SUMMARY build=" << kBuildStamp << " anchors=0 validated_pools=0\n";
         std::cout << "next: no block whose first entry decodes as \"" << kExpectedFirst << "\" with "
                   << min_entries << "+ entries exists in the captured memory. Dump the bytes around a"
@@ -1423,6 +1520,24 @@ void PrintDumpFNameBlocks(
               << " marker_hits=" << marker_hits << " region_probes=" << region_probes << '\n';
     std::cout << "note: an in-image referrer gives an RVA that survives restarts, a heap referrer does"
                  " not. Decoded names prove the pool layout only; no object header field is implied.\n";
+}
+
+void PrintDumpFNameLayout(
+    const std::filesystem::path& path,
+    const std::uint64_t va,
+    const std::uint32_t window_size,
+    const std::size_t max_hits) {
+    if (va == 0) {
+        throw std::invalid_argument("region VA must be nonzero");
+    }
+    const MappedFile file(path);
+    const auto bytes = file.Bytes();
+    const auto ranges = ReadMemoryRanges(bytes, ReadStreams(bytes));
+    const auto read = [&](const std::uint64_t address, const std::uint64_t size) {
+        return ReadCaptured(bytes, ranges, address, size);
+    };
+    std::cout << "build=" << kBuildStamp << "\n";
+    PrintNameLayout(std::cout, "dump layout", read, va, window_size, max_hits);
 }
 
 } // namespace arc

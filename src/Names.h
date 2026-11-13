@@ -8,6 +8,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace arc {
@@ -144,6 +145,44 @@ struct NameBlockChain {
     std::uint32_t min_entries,
     std::size_t max_entries_per_block,
     std::size_t max_blocks);
+
+// A position where the measured header encoding announces a printable, null-terminated string that
+// starts right there. This makes no assumption about how entries are chained, so the gaps between hits
+// are what reveal the real stride.
+struct NameHit {
+    std::uint32_t offset{};
+    std::uint32_t length{};
+    bool wide{};
+    std::string text;
+};
+
+[[nodiscard]] std::vector<NameHit> FindNameLikeEntries(
+    std::span<const std::uint8_t> window,
+    const NameCodec& codec,
+    std::size_t max_hits);
+
+// Format-agnostic fallback: every maximal run of printable ASCII terminated by a NUL byte. Works
+// even when the entry header itself is encrypted, so the stride between strings is still measurable.
+[[nodiscard]] std::vector<NameHit> FindAsciiRuns(
+    std::span<const std::uint8_t> window,
+    std::uint32_t min_length,
+    std::size_t max_hits);
+
+// Distinct byte gaps between consecutive hits, with how often each one occurs. A single gap value
+// across the whole block means a fixed stride model; alternating values mean extra per-entry fields.
+[[nodiscard]] std::vector<std::pair<std::uint32_t, std::uint32_t>> GapHistogram(
+    std::span<const NameHit> hits);
+
+// Reads `window` bytes at `va` through `read` and prints what the bytes actually say about the entry
+// layout: every header-shaped position whose string decodes, the stride between them, the raw hex.
+// Shared by dump analysis and the live process, because the same question needs the same measurement.
+void PrintNameLayout(
+    std::ostream& out,
+    std::string_view label,
+    const CapturedRead& read,
+    std::uint64_t va,
+    std::uint32_t window,
+    std::size_t max_hits);
 
 // True for characters allowed in an FName: printable ASCII, no space, no control bytes.
 [[nodiscard]] bool IsNameCharacter(char value) noexcept;

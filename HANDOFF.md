@@ -233,13 +233,62 @@ stop="end of chain: null next pointer"`, `referrer=0x140000100 -> 0x200000f0 [im
 with a portable `MappedFile` declaration and `Process.h` with a `WideToUtf8` declaration, compile
 `probe_main.cpp shim.cpp DumpFile.cpp Names.cpp Pattern.cpp Chain.cpp` with `-D_WIN32`.
 
-Not run against a game dump, not run against a live process, nothing observed in game. ESP, Aim,
-Trigger, Minimap and menu remain unimplemented.
+Both commands have since been run on the user's machine; results below. Nothing observed in game. ESP,
+Aim, Trigger, Minimap and menu remain unimplemented.
+
+## Run results and layout measurement (2026-11-13, same night)
+
+`dump-fname-blocks` on the real 12 956 266 993-byte dump:
+
+```text
+build=2026-11-13-fname-blocks-probe
+block_size=0x20000 min_entries=64 expected_first="None" captured_ranges=63459
+discovery scanned_bytes=12943527936 marker_hits=1140 region_probes=1004 anchors=0
+SUMMARY build=2026-11-13-fname-blocks-probe anchors=0 validated_pools=0
+```
+
+`PREDICATE` was never reached: neither carried codec (`measured_shift6_wide0_str2`,
+`alt_len_bits_0_9_wide10`) decodes a dense entry stream from any of the 1 004 probed regions around
+those 1 140 `None` markers. The entry header format is therefore still unknown, and a third guessed
+codec is not the answer — the layout has to be read off the bytes. `arc::FindAsciiRuns` +
+`arc::GapHistogram` (in `src/Names.cpp`) do exactly that and are format-independent: they report every
+printable NUL-terminated run, the byte gap between consecutive runs, and the 16-bit word in front of
+each string. `dump-fname-blocks` now ranks the probed regions by string density and prints the top eight
+with 64 raw bytes when the strict walk fails; `dump-fname-layout <DMP> <VA> [window] [max_hits]` and
+`live-fname-layout <pid> <VA> [window] [max_hits]` run the same measurement (`arc::PrintNameLayout`)
+against any address, dump or live.
+
+`probe 14292` on the live process: elevated `yes`, `se_debug_privilege=enabled`
+(`privileges_reported=24`), all eight rights granted, `reader_handle=open`,
+`vm_read_at_image_base=MZ ok`, `private_region_reads=5 of 5`, `toolhelp_snapshot=ok modules=77`,
+`image_base=0x7ff7e6370000`. External user-mode reading is fully viable on this build, which settles
+external reader + overlay as the architecture; the old `VirtualAllocEx` error 5 is no longer a reason to
+prefer internal. Live base is ASLR'd, so every dump-derived value must be re-based on the live image
+base, and the dump's `SizeOfImage=0x139F9000` is not usable as the live size without measuring it.
+
+Two of the probe's own numbers were my bug rather than game facts and are now fixed in `src/Process.cpp`:
+the PEB walk printed 2 modules with a garbage second entry, and it reported
+`PioneerGame.exe size=0x1d82000` from the `LDR_DATA_TABLE_ENTRY`, contradicting the dump's PE header. The
+walk advances through `InMemoryOrderLinks.Flink` at record `+0x10`, is cross-checked against Toolhelp
+(`peb_walk validation: modules=N bases_also_in_toolhelp=K`, with an explicit warning when they disagree),
+and `live_pe_headers` now reads `SizeOfImage`, `SizeOfHeaders`, the section table and `last_page_readable`
+from the image itself in memory.
+
+Verified locally: dense synthetic dump still `PREDICATE PASS blocks=3 names=210 pool_referrers_image=2
+heap=3` (no regression); a second synthetic dump built with an 8-byte tail after each string, where the
+strict chained walk stops after one entry, now reports `ascii_run block_base=0x20000100 runs=64
+string_to_string=0x16x63` and `partial block_base=0x20000100 name_like_entries=64 gaps=0x10x63` — the
+real stride is visible instead of a bare `anchors=0`. Core tests (including `TestNameLayoutProbe`) pass
+strict and under ASan/UBSan. Windows build: Zig `x86_64-windows-gnu`, `-Werror`, exit 0, size
+`1,245,184`, SHA-256 `17ed9f27a15d91762c6fdd82626e382cbcdca77af81d2e64f8b610f492fa17c1`, stamp
+`2026-11-13-layout-probe`, MZ/PE/AMD64/PE32+ checked by hand. Not run in game.
 
 ## Shortest next verification step
 
-1. `arc_tool version` then `arc_tool dump-fname-blocks "<PioneerGame (3).DMP>" 0x140000000 0x139F9000`
-   and `arc_tool probe <pid>` in a live match.
+1. `arc_tool version` (expect `build=2026-11-13-layout-probe`), then re-run
+   `arc_tool dump-fname-blocks "<PioneerGame (3).DMP>" 0x140000000 0x139F9000` — the layout section is the
+   part that matters — and `arc_tool probe <pid>` in a live match, then follow up with
+   `arc_tool dump-fname-layout <DMP> <block_base>` on whatever region the report points at.
 2. Unzip `Dumper7-ARC-Raiders.zip` into Dropbox so its `.hpp`/`.txt` files can be read through the
    connector; if it is a `CL-1450810` dump, validate its `GNames`/`GObjects`/`UWorld` RVAs against the
    dump instead of recovering them.

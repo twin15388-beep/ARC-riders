@@ -49,6 +49,14 @@ void PrintDumpFNamePool(
     std::uint64_t image_size);
 // Anchor-driven FName pool recovery: finds the block that starts with a known first name, follows the
 // block chain, and reports every captured pointer to that block (in-image hits are GNames RVAs).
+// Prints the observed name-entry layout of one region: every position whose header decodes as a
+// printable null-terminated string, the gaps between them, and the raw bytes. Used to measure the
+// entry stride instead of assuming it.
+void PrintDumpFNameLayout(
+    const std::filesystem::path& path,
+    std::uint64_t va,
+    std::uint32_t window_size,
+    std::size_t max_hits);
 void PrintDumpFNameBlocks(
     const std::filesystem::path& path,
     std::uint64_t image_base,

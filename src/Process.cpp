@@ -2,6 +2,7 @@
 
 #include "Process.h"
 
+#include "Names.h"
 #include "Version.h"
 
 #include <windows.h>
@@ -13,6 +14,9 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <numeric>
+#include <optional>
+#include <span>
 #include <limits>
 #include <stdexcept>
 #include <string_view>
@@ -166,6 +170,11 @@ std::uint16_t LoadLe16(const std::uint8_t* const bytes) {
     return static_cast<std::uint16_t>(bytes[0]) | (static_cast<std::uint16_t>(bytes[1]) << 8);
 }
 
+std::uint32_t LoadLe32(const std::uint8_t* const bytes) {
+    return static_cast<std::uint32_t>(bytes[0]) | (static_cast<std::uint32_t>(bytes[1]) << 8) |
+        (static_cast<std::uint32_t>(bytes[2]) << 16) | (static_cast<std::uint32_t>(bytes[3]) << 24);
+}
+
 std::uint64_t LoadLe64(const std::uint8_t* const bytes) {
     std::uint64_t value = 0;
     for (std::size_t i = 0; i < 8; ++i) {
@@ -237,7 +246,94 @@ void PrintSelfTokenState() {
               << " privileges_reported=" << privileges->PrivilegeCount << '\n';
 }
 
-void PrintPebModules(const HANDLE handle, const NtQueryInformationProcessFn query) {
+// SizeOfImage and the section map come from the image's own headers, not from the LDR entry: an
+// earlier run printed a module size that contradicted the dump's PE header, so the LDR value is
+// reported next to this one instead of being trusted.
+void PrintLiveImageHeaders(const HANDLE handle, const std::uint64_t image_base) {
+    if (image_base == 0) {
+        return;
+    }
+    std::array<std::uint8_t, 0x1000> header{};
+    if (!ReadRaw(handle, image_base, header.data(), header.size())) {
+        std::cout << "  live_pe_headers=unreadable win32_error=" << ::GetLastError() << '\n';
+        return;
+    }
+    if (header[0] != 'M' || header[1] != 'Z') {
+        std::cout << "  live_pe_headers=not MZ\n";
+        return;
+    }
+    const auto e_lfanew = LoadLe32(header.data() + 0x3C);
+    if (e_lfanew == 0 || e_lfanew + 0x18 + 0xF0 > header.size() ||
+        LoadLe32(header.data() + e_lfanew) != 0x00004550U) {
+        std::cout << "  live_pe_headers=no PE signature at e_lfanew=0x" << std::hex << e_lfanew << std::dec
+                  << '\n';
+        return;
+    }
+    const auto machine = LoadLe16(header.data() + e_lfanew + 4);
+    const auto section_count = LoadLe16(header.data() + e_lfanew + 6);
+    const auto optional_size = LoadLe16(header.data() + e_lfanew + 20);
+    const auto optional = e_lfanew + 24;
+    const auto magic = LoadLe16(header.data() + optional);
+    if (magic != 0x20B) {
+        std::cout << "  live_pe_headers=unexpected optional magic 0x" << std::hex << magic << std::dec << '\n';
+        return;
+    }
+    const auto image_size = LoadLe32(header.data() + optional + 0x38);
+    const auto headers_size = LoadLe32(header.data() + optional + 0x3C);
+    std::cout << "  live_pe_headers machine=0x" << std::hex << machine << " sections=" << std::dec
+              << section_count << " SizeOfImage=0x" << std::hex << image_size << " SizeOfHeaders=0x"
+              << headers_size << std::dec << '\n';
+    const auto sections = e_lfanew + 24 + optional_size;
+    for (std::uint16_t index = 0; index < section_count && sections + (index + 1) * 0x28 <= header.size()
+        && index < 12; ++index) {
+        const auto* entry = header.data() + sections + index * 0x28;
+        std::string name;
+        for (std::size_t i = 0; i < 8 && entry[i] != 0; ++i) {
+            name.push_back(static_cast<char>(entry[i]));
+        }
+        std::cout << "    section " << name << " rva=0x" << std::hex << LoadLe32(entry + 0x0C)
+                  << " vsize=0x" << LoadLe32(entry + 0x08) << " raw=0x" << LoadLe32(entry + 0x10)
+                  << " chars=0x" << LoadLe32(entry + 0x1C) << std::dec << '\n';
+    }
+    if (image_size != 0) {
+        std::array<std::uint8_t, 2> last{};
+        std::cout << "  last_page_readable="
+                  << (ReadRaw(handle, image_base + image_size - 0x1000, last.data(), last.size()) ? "yes" : "no")
+                  << '\n';
+    }
+}
+
+struct ToolhelpModule {
+    std::uint64_t base{};
+    std::uint32_t size{};
+    std::string name;
+};
+
+std::vector<ToolhelpModule> CollectToolhelpModules(const std::uint32_t pid) {
+    std::vector<ToolhelpModule> modules;
+    const HANDLE snapshot = ::CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        std::cout << "toolhelp_snapshot=failed win32_error=" << ::GetLastError() << '\n';
+        return modules;
+    }
+    MODULEENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    for (BOOL more = ::Module32FirstW(snapshot, &entry); more != FALSE; more = ::Module32NextW(snapshot, &entry)) {
+        ToolhelpModule module;
+        module.base = reinterpret_cast<std::uint64_t>(entry.modBaseAddr);
+        module.size = entry.modBaseSize;
+        module.name = WideToUtf8(entry.szModule);
+        modules.push_back(std::move(module));
+        if (modules.size() >= 2048) {
+            break;
+        }
+    }
+    ::CloseHandle(snapshot);
+    return modules;
+}
+
+void PrintPebModules(const HANDLE handle, const NtQueryInformationProcessFn query,
+                     const std::vector<ToolhelpModule>& toolhelp) {
     PROCESS_BASIC_INFORMATION basic{};
     const NTSTATUS status = query(
         handle, ProcessBasicInformation, &basic, static_cast<ULONG>(sizeof(basic)), nullptr);
@@ -273,6 +369,7 @@ void PrintPebModules(const HANDLE handle, const NtQueryInformationProcessFn quer
     const auto list_head = ldr + kLdrInMemoryOrderList;
     auto entry = LoadLe64(ldr_header.data() + kLdrInMemoryOrderList);
     std::cout << "  modules_via_peb:\n";
+    std::vector<std::uint64_t> walked_bases;
     for (std::size_t index = 0;
          entry != 0 && entry != list_head && entry > kEntryLinksOffset && index < 2048; ++index) {
         const auto entry_va = entry - kEntryLinksOffset;
@@ -295,8 +392,27 @@ void PrintPebModules(const HANDLE handle, const NtQueryInformationProcessFn quer
         }
         std::cout << "    " << name << " base=0x" << std::hex << module_base
                   << " size=0x" << module_size << std::dec << '\n';
-        entry = LoadLe64(record.data());
+        walked_bases.push_back(module_base);
+        // Flink of the list the walk is anchored on (InMemoryOrderLinks at +0x10). Reading +0x00
+        // instead walks the InLoadOrder list and shifts every following record by 0x10.
+        entry = LoadLe64(record.data() + kEntryLinksOffset);
     }
+    // A walk that shifts records by 0x10 still produces plausible-looking first entries, so the only
+    // trustworthy check is agreement with a source that does not depend on these offsets.
+    std::size_t matched = 0;
+    for (const auto base : walked_bases) {
+        if (base != 0 && std::any_of(toolhelp.begin(), toolhelp.end(),
+                [base](const ToolhelpModule& module) { return module.base == base; })) {
+            ++matched;
+        }
+    }
+    std::cout << "  peb_walk validation: modules=" << walked_bases.size() << " bases_also_in_toolhelp="
+              << matched << " toolhelp_modules=" << toolhelp.size() << '\n';
+    if (!toolhelp.empty() && !walked_bases.empty() && matched * 2 < walked_bases.size()) {
+        std::cout << "  the PEB walk disagrees with Toolhelp: do not use these bases or sizes, trust "
+                     "Toolhelp and re-measure the entry offsets\n";
+    }
+    PrintLiveImageHeaders(handle, image_base);
 }
 
 void PrintPrivateReadProbe(const HANDLE handle) {
@@ -395,29 +511,58 @@ void PrintProcessProbe(const std::uint32_t pid) {
         if (query == nullptr) {
             std::cout << "  NtQueryInformationProcess unavailable\n";
         } else {
-            PrintPebModules(reader, query);
+            PrintPebModules(reader, query, CollectToolhelpModules(pid));
         }
         // A handle can be granted with PROCESS_VM_READ silently stripped by a protection callback, so
         // the only meaningful test is an actual read. One address is one point; sample several.
         PrintPrivateReadProbe(reader);
     }
 
-    const HANDLE snapshot = ::CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
-    if (snapshot == INVALID_HANDLE_VALUE) {
-        std::cout << "toolhelp_snapshot=failed win32_error=" << ::GetLastError() << '\n';
-    } else {
-        MODULEENTRY32W entry{};
-        entry.dwSize = sizeof(entry);
-        std::size_t count = 0;
-        for (BOOL more = ::Module32FirstW(snapshot, &entry); more != FALSE; more = ::Module32NextW(snapshot, &entry)) {
-            ++count;
-            if (count >= 2048) {
-                break;
-            }
+    const auto toolhelp = CollectToolhelpModules(pid);
+    std::cout << "toolhelp_snapshot=" << (toolhelp.empty() ? "failed_or_empty" : "ok")
+              << " modules=" << toolhelp.size() << '\n';
+    for (const auto& module : toolhelp) {
+        if (module.name == "PioneerGame.exe") {
+            std::cout << "toolhelp_main_module base=0x" << std::hex << module.base << " size=0x"
+                      << module.size << std::dec << '\n';
         }
-        std::cout << "toolhelp_snapshot=ok modules=" << count << '\n';
-        ::CloseHandle(snapshot);
     }
+}
+
+void PrintProcessFNameLayout(const std::uint32_t pid, const std::uint64_t va, const std::uint32_t window,
+                            const std::size_t max_hits) {
+    const HANDLE handle = ::OpenProcess(
+        PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+    if (handle == nullptr) {
+        ThrowWin32("OpenProcess for the layout read failed");
+    }
+    if (window < 0x40 || window > 0x100000) {
+        throw std::invalid_argument("window must be 0x40..0x100000 (the reader allocates it up front)");
+    }
+    std::vector<std::uint8_t> scratch(window);
+    const CapturedRead read = [&](const std::uint64_t address, const std::uint64_t size)
+        -> std::optional<std::span<const std::uint8_t>> {
+        if (address < va) {
+            return std::nullopt;
+        }
+        const auto offset = static_cast<std::size_t>(address - va);
+        if (offset >= scratch.size() || size == 0) {
+            return std::nullopt;
+        }
+        const auto want = std::min<std::size_t>(size, scratch.size() - offset);
+        std::fill(scratch.begin() + offset, scratch.begin() + offset + want, 0);
+        SIZE_T transferred = 0;
+        const BOOL ok = ::ReadProcessMemory(
+            handle, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)),
+            scratch.data() + offset, want, &transferred);
+        if (ok == FALSE || transferred == 0) {
+            return std::nullopt;
+        }
+        return std::span<const std::uint8_t>{scratch.data() + offset, transferred};
+    };
+    std::cout << "build=" << kBuildStamp << '\n';
+    PrintNameLayout(std::cout, "live layout", read, va, window, max_hits);
+    ::CloseHandle(handle);
 }
 
 std::string WideToUtf8(const std::wstring_view value) {
