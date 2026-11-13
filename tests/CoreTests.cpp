@@ -390,6 +390,31 @@ void TestNameLayoutProbe() {
         "empty window produced hits");
 }
 
+void TestBackwardChain() {
+    // Zero padding, unlike the 0xAA tail of PutNameEntryWithTail: the backward chain only accepts a
+    // predecessor when everything between its last name byte and the next entry is zero.
+    std::vector<std::uint8_t> block;
+    for (const auto* name : {"None", "World", "Actor", "Pawn", "PlayerController"}) {
+        const auto start = block.size();
+        block.resize(start + 2 + std::string_view(name).size() + 1, 0);
+        PutU16At(block, start, static_cast<std::uint16_t>(std::string_view(name).size() << 6));
+        std::memcpy(block.data() + start + 2, name, std::string_view(name).size());
+        while (block.size() % 8 != 0) {
+            block.push_back(0);
+        }
+    }
+    const std::span<const std::uint8_t> view{block};
+    const auto back = arc::BackwardNameStream(view, arc::kNameCodecMeasured, 3 * 8, 16);
+    Check(back.size() == 3, "backward chain length");
+    Check(back.size() == 3 && back.front().offset == 0 && back.front().text == "None",
+        "backward chain reached entry 0");
+    Check(back.size() == 3 && back.back().text == "Actor", "backward chain order");
+    Check(back.size() == 3 && back[1].entry_size == 8 && back[1].pad_after == 0,
+        "backward entry size and pad");
+    Check(arc::BackwardNameStream(view, arc::kNameCodecMeasured, 5, 16).empty(),
+        "backward chain accepted an unexplained gap");
+}
+
 void TestViewportDecrypt() {
     std::array<std::uint8_t, 0x100> bank{};
     const std::uint64_t lo = 0xF7149774B727E060ULL, hi = 0x642BFE20256AF201ULL;
@@ -416,6 +441,7 @@ int main() {
         TestNameEntries();
         TestNameBlockChain();
         TestNameLayoutProbe();
+        TestBackwardChain();
         TestViewportDecrypt();
         std::cout << "All core checks passed\n";
         return 0;

@@ -154,6 +154,12 @@ struct NameHit {
     std::uint32_t length{};
     bool wide{};
     std::string text;
+    // The measurement that matters: bytes between one entry start and the next decoded position, and how
+    // many zero bytes sit between the terminator and the following header. A constant entry_size across a
+    // region means fixed-size records; entry_size == 2 + payload + pad with a varying pad means the
+    // entries are packed back to back and the record size comes from the length field alone.
+    std::uint32_t entry_size{};
+    std::uint32_t pad_after{};
 };
 
 [[nodiscard]] std::vector<NameHit> FindNameLikeEntries(
@@ -167,6 +173,16 @@ struct NameHit {
     std::span<const std::uint8_t> window,
     std::uint32_t min_length,
     std::size_t max_hits);
+
+// Walks the packed name stream backwards from `stop` by requiring each predecessor to end exactly at
+// `stop` (allowing zero padding). This is how the start of a block is recovered from an anchor found in
+// the middle of it, which is the normal case: a marker search lands on whatever name matched, not on
+// entry 0.
+[[nodiscard]] std::vector<NameHit> BackwardNameStream(
+    std::span<const std::uint8_t> window,
+    const NameCodec& codec,
+    std::uint32_t stop,
+    std::size_t max_entries);
 
 // Distinct byte gaps between consecutive hits, with how often each one occurs. A single gap value
 // across the whole block means a fixed stride model; alternating values mean extra per-entry fields.

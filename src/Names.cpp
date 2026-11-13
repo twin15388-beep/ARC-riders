@@ -1,6 +1,7 @@
 #include "Names.h"
 
 #include <algorithm>
+#include <optional>
 #include <iomanip>
 #include <ostream>
 #include <span>
@@ -220,6 +221,16 @@ std::vector<NameHit> FindNameLikeEntries(
             hit.offset = entry;
             hit.length = length;
             hit.wide = wide;
+            const std::size_t terminator_end = position + payload;
+            std::uint32_t pad = 0;
+            while (pad < 16 && terminator_end + pad < window.size() &&
+                   window[terminator_end + pad] == 0) {
+                ++pad;
+            }
+            // A pad of only 0 or 1 byte is alignment, not record padding; report it either way and let
+            // the caller's histogram decide.
+            hit.pad_after = pad >= 2 ? pad : 0;
+            hit.entry_size = codec.string_offset + payload + hit.pad_after;
             const auto* text = window.data() + position;
             for (std::uint32_t i = 0; i < length; ++i) {
                 const auto code = wide ? LoadU16(text + i * 2) : text[i];
@@ -261,6 +272,68 @@ std::vector<NameHit> FindAsciiRuns(
         }
         position = end + 1;
     }
+    return hits;
+}
+
+std::vector<NameHit> BackwardNameStream(
+    const std::span<const std::uint8_t> window,
+    const NameCodec& codec,
+    const std::uint32_t stop,
+    const std::size_t max_entries) {
+    std::vector<NameHit> hits;
+    if (codec.string_offset < kHeaderBytes || codec.length_bits == 0 || codec.length_bits > 16 ||
+        codec.length_shift + codec.length_bits > 16) {
+        return hits;
+    }
+    const std::uint32_t mask = (1U << codec.length_bits) - 1U;
+    std::uint32_t position = stop;
+    while (hits.size() < max_entries && position > codec.string_offset + 1) {
+        std::optional<NameHit> best;
+        // The shortest predecessor whose bytes explain the gap exactly is the real one: a longer match
+        // would mean an entry that contains another entry.
+        for (std::uint32_t size = 4; size <= 0x240 && size <= position; size += 2) {
+            const std::uint32_t entry = position - size;
+            const auto header = LoadU16(window.data() + entry);
+            const auto length = (header >> codec.length_shift) & mask;
+            const bool wide = ((header >> codec.wide_bit) & 1U) != 0;
+            if (length < 1 || length > kMaxNameLength) {
+                continue;
+            }
+            const std::uint32_t payload = static_cast<std::uint32_t>(length + 1U) * (wide ? 2U : 1U);
+            if (codec.string_offset + payload > size) {
+                continue;
+            }
+            const auto* text = window.data() + entry + codec.string_offset;
+            bool ok = wide ? LoadU16(text + length * 2) == 0 : text[length] == 0;
+            for (std::uint32_t i = 0; i < length && ok; ++i) {
+                ok = wide ? IsWideNameCharacter(LoadU16(text + i * 2))
+                          : IsNameCharacter(static_cast<char>(text[i]));
+            }
+            for (std::uint32_t i = codec.string_offset + payload; i < size && ok; ++i) {
+                ok = window[entry + i] == 0;  // only zero padding is allowed between the entries
+            }
+            if (!ok) {
+                continue;
+            }
+            NameHit hit;
+            hit.offset = entry;
+            hit.length = length;
+            hit.wide = wide;
+            hit.entry_size = size;
+            hit.pad_after = size - codec.string_offset - payload;
+            for (std::uint32_t i = 0; i < length; ++i) {
+                AppendUtf8(hit.text, wide ? LoadU16(text + i * 2) : text[i]);
+            }
+            best = hit;
+            break;
+        }
+        if (!best) {
+            break;
+        }
+        hits.push_back(*best);
+        position = best->offset;
+    }
+    std::reverse(hits.begin(), hits.end());
     return hits;
 }
 
@@ -334,10 +407,39 @@ void PrintNameLayout(
         out << label << ": max_hits must be 1..4096\n";
         return;
     }
-    const auto bytes = ReadWindow(read, va, window);
-    out << label << ": region=0x" << std::hex << va << " window=0x" << window << std::dec << '\n';
+    // Reading starts before the supplied address on purpose: a marker search lands on whatever name
+    // matched, so the entries before it are exactly what has to be chained to find the start of the
+    // block. Everything is reported relative to the read region and the anchor offset is printed.
+    std::uint32_t lead = window > 0x440 ? 0x400U : 0U;
+    auto region_va = va - lead;
+    auto bytes = ReadWindow(read, region_va, window + lead);
+    if (bytes.size() <= lead) {
+        // The bytes before the supplied address are not captured (the read starts inside the block);
+        // report without the lead rather than dereferencing a window that does not exist.
+        lead = 0;
+        region_va = va;
+        bytes = ReadWindow(read, va, window);
+    }
+    const std::uint32_t anchor = lead;
+    if (bytes.empty()) {
+        out << label << ": region=0x" << std::hex << va << std::dec
+            << " is not present in the captured ranges - read a VA that dump-fname-blocks printed\n";
+        return;
+    }
+    out << label << ": region=0x" << std::hex << region_va << " window=0x" << bytes.size()
+        << " anchor=0x" << va << " (+" << std::dec << anchor << ")" << std::hex
+        << ", offsets below are from the region start)\n";
+    const std::span<const std::uint8_t> tail{
+        anchor == 0 ? bytes.data() : bytes.data() + anchor,
+        bytes.size() > anchor ? bytes.size() - anchor : std::size_t{0}};
+    const auto shift = [anchor](std::vector<NameHit> hits) {
+        for (auto& hit : hits) {
+            hit.offset += anchor;
+        }
+        return hits;
+    };
     for (const auto& codec : kNameCodecCandidates) {
-        const auto hits = FindNameLikeEntries(bytes, codec, max_hits);
+        const auto hits = shift(FindNameLikeEntries(tail, codec, max_hits));
         out << "  codec=" << codec.label << " name_like=" << hits.size() << " gaps=";
         const auto gaps = GapHistogram(hits);
         for (std::size_t i = 0; i < gaps.size() && i < 8; ++i) {
@@ -352,7 +454,7 @@ void PrintNameLayout(
                 << '\n';
         }
     }
-    const auto runs = FindAsciiRuns(bytes, 3, max_hits);
+    const auto runs = shift(FindAsciiRuns(tail, 3, max_hits));
     out << "  ascii_runs (independent of the header format): " << runs.size() << " string_to_string=";
     const auto run_gaps = GapHistogram(runs);
     for (std::size_t i = 0; i < run_gaps.size() && i < 8; ++i) {
@@ -367,9 +469,79 @@ void PrintNameLayout(
             << " u16_before=0x" << PeekU16(bytes, back_off) << " \"" << runs[i].text << "\"" << std::dec
             << '\n';
     }
+    // The stream report treats the supplied VA as the start of one entry. A marker search lands on
+    // whatever name matched, so the block start has to be recovered by chaining backwards; the entry
+    // sizes on both sides are what identify the record layout.
+    out << "\n  packed stream measured from the supplied VA as an entry start:\n";
+    const auto forward = shift(FindNameLikeEntries(tail, kNameCodecMeasured, max_hits));
+    std::uint32_t previous = 0;
+    std::size_t shown = 0;
+    for (const auto& hit : forward) {
+        if (shown++ >= 40) {
+            break;
+        }
+        out << "    +" << std::hex << std::setw(4) << std::setfill('0') << hit.offset
+            << " hdr=0x" << std::setw(4) << PeekU16(bytes, hit.offset) << " len=" << std::dec
+            << hit.length << " size=0x" << std::hex << hit.entry_size
+            << " gap=0x" << (hit.offset >= previous ? hit.offset - previous : 0) << std::dec
+            << " pad=" << hit.pad_after << " \"" << hit.text << "\"\n";
+        previous = hit.offset;
+    }
+    const auto backward = BackwardNameStream(bytes, kNameCodecMeasured,
+        forward.empty() ? anchor : forward.front().offset, max_hits);
+    std::uint32_t span_back = 0;  // bytes from the first entry of the backward chain to the anchor
+    if (!backward.empty()) {
+        span_back = forward.empty() ? 0 : forward.front().offset - backward.front().offset;
+        out << "    backward span=0x" << std::hex << span_back << std::dec
+            << " entries=" << backward.size() << '\n';
+        out << "    backwards from there (" << backward.size() << " entries):\n";
+        for (std::size_t i = 0; i < backward.size() && i < 24; ++i) {
+            out << "    -" << std::hex << std::setw(4) << std::setfill('0') << backward[i].offset
+                << " hdr=0x" << std::setw(4) << PeekU16(bytes, backward[i].offset) << " len=" << std::dec
+                << backward[i].length << " size=0x" << std::hex << backward[i].entry_size << std::dec
+                << " \"" << backward[i].text << "\"\n";
+        }
+    } else {
+        out << "    backwards: the predecessor of the first decoded entry is not explained by the packed"
+               " layout, so the record size or the header position is different there\n";
+    }
+    out << "  entry sizes forward: ";
+    {
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> sizes;
+        for (const auto& hit : forward) {
+            const auto found = std::find_if(sizes.begin(), sizes.end(),
+                [&](const std::pair<std::uint32_t, std::uint32_t>& e) { return e.first == hit.entry_size; });
+            if (found == sizes.end()) {
+                sizes.emplace_back(hit.entry_size, 1U);
+            } else {
+                ++found->second;
+            }
+        }
+        std::sort(sizes.begin(), sizes.end(), [](const auto& left, const auto& right) {
+            return left.second != right.second ? left.second > right.second : left.first < right.first; });
+        for (std::size_t i = 0; i < sizes.size() && i < 8; ++i) {
+            out << (i == 0 ? "" : ",") << "0x" << std::hex << sizes[i].first << std::dec << "x"
+                << sizes[i].second;
+        }
+        if (sizes.empty()) {
+            out << "none";
+        }
+        out << "\n";
+    }
+    if (!backward.empty()) {
+        const auto block_start = region_va + backward.front().offset;
+        const auto end = !forward.empty() ? forward.back().offset + forward.back().entry_size
+                                          : anchor;
+        out << "  block start hint=0x" << std::hex << block_start << " (VA of the first entry in this"
+            << " chain, " << std::dec << backward.size() + forward.size() << " entries spanned, "
+            << std::hex << (end > backward.front().offset ? end - backward.front().offset : 0)
+            << std::dec << " bytes)\n";
+        out << "  read it directly with: dump-fname-layout <dmp> 0x" << std::hex << block_start
+            << std::dec << " 0x800 512\n";
+    }
     out << "  raw bytes:\n";
     const std::span<const std::uint8_t> view{bytes};
-    PrintRawBytes(out, "    ", view.size() > 0x400 ? view.first(0x400) : view);
+    PrintRawBytes(out, "    ", view);
 }
 
 std::vector<HeaderProbe> ProbeBlockHeaders(

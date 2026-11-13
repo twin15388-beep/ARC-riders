@@ -22,6 +22,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace arc {
@@ -1122,6 +1123,9 @@ struct AnchorHit {
     // name -> (block 0 pool index), filled only when the block starts with the empty name. The pool
     // index is what a UObject's FName comparison field stores: (block << 16) | (entry_offset / 2).
     std::vector<std::pair<std::string, std::uint32_t>> block0_indices;
+    // True when the region was accepted on local entry density alone, without claiming that the entries
+    // follow each other back to back or that a block chain was found.
+    bool dense_table{};
 };
 
 constexpr std::array<std::string_view, 9> kWantedNames{{
@@ -1207,6 +1211,8 @@ void PrintDumpFNameBlocks(
     std::size_t validated_anchors = 0;
     std::vector<PartialHit> partials;  // best decoders that missed the strict gate, for layout reading
     std::vector<RunHit> run_hits;      // header-format independent candidates, ranked by string density
+    std::vector<AnchorHit> dense_tables;
+    constexpr std::size_t max_tables = 8;
     constexpr std::size_t max_partials = 8;
     constexpr std::uint32_t layout_window = 0x400;
     std::set<std::uint64_t> seen_bases;
@@ -1314,6 +1320,35 @@ void PrintDumpFNameBlocks(
                                     run_hits.pop_back();
                                 }
                             }
+                            // A region whose entries are individually decodable but not back to back is still a name table:
+                        // chaining is a property of the pool block layout, not of the entry header. Density
+                        // alone therefore qualifies, and the referrer sweep on it is what can yield GNames.
+                        const auto dense = FindNameLikeEntries(*block, kNameCodecMeasured, 8192);
+                        if (dense.size() >= min_entries) {
+                            AnchorHit table;
+                            table.data_va = base;
+                            table.codec = &kNameCodecMeasured;
+                            table.entries = static_cast<std::uint32_t>(dense.size());
+                            table.consumed = dense.empty()
+                                ? 0U
+                                : dense.back().offset + dense.back().entry_size;
+                            table.capped = dense.size() >= 8192;
+                            table.dense_table = true;
+                            for (const auto& hit : dense) {
+                                for (const auto wanted : kWantedNames) {
+                                    if (hit.text == wanted) {
+                                        table.block0_indices.emplace_back(std::string(wanted), hit.offset / 2U);
+                                    }
+                                }
+                            }
+                            const auto place = std::find_if(dense_tables.begin(), dense_tables.end(),
+                                [&table](const AnchorHit& other) { return other.data_va == table.data_va; });
+                            if (place == dense_tables.end()) {
+                                dense_tables.push_back(std::move(table));
+                            } else if (table.entries > place->entries) {
+                                *place = std::move(table);
+                            }
+                        }
                             hits = FindNameLikeEntries(block->first(span), kNameCodecMeasured, 512);
                             if (hits.size() >= 4) {
                                 PartialHit partial;
@@ -1384,6 +1419,51 @@ void PrintDumpFNameBlocks(
                   << (anchors.size() >= max_anchors + supplied_anchors ? " (anchor cap reached)" : "")
                   << '\n';
     }
+    // Every captured pointer to a candidate region: an in-image hit is a GNames candidate with a stable
+    // RVA, a heap hit is only useful inside this dump.
+    const auto SweepReferrers = [&](const std::vector<std::uint64_t>& wanted) {
+        auto targets = wanted;
+        std::sort(targets.begin(), targets.end());
+        targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
+        if (targets.empty()) {
+            return std::pair<std::size_t, std::size_t>{0, 0};
+        }
+        const auto target_lo = targets.front();
+        const auto target_hi = targets.back();
+        std::size_t image_hits = 0;
+        std::size_t heap_hits = 0;
+        for (const auto& range : ranges) {
+            if (range.size < 8) {
+                continue;
+            }
+            const auto data = bytes.subspan(
+                static_cast<std::size_t>(range.file_offset), static_cast<std::size_t>(range.size));
+            for (std::size_t position = 0; position + 8 <= data.size(); position += 8) {
+                const auto value = U64(data.data() + position);
+                if (value < target_lo || value > target_hi) {
+                    continue;
+                }
+                if (!std::binary_search(targets.begin(), targets.end(), value)) {
+                    continue;
+                }
+                const auto va = range.va + position;
+                std::cout << "  referrer=0x" << std::hex << va << " -> 0x" << value << std::dec
+                          << (in_image(va) ? " [image]" : " [heap]");
+                if (in_image(va)) {
+                    std::cout << " RVA=0x" << std::hex << (va - image_base) << std::dec;
+                    ++image_hits;
+                } else {
+                    ++heap_hits;
+                }
+                std::cout << '\n';
+                if (image_hits + heap_hits >= referrer_cap) {
+                    return std::pair{image_hits, heap_hits};
+                }
+            }
+        }
+        return std::pair{image_hits, heap_hits};
+    };
+
     for (const auto& anchor : anchors) {
         std::cout << "anchor block_data=0x" << std::hex << anchor.data_va << std::dec
                   << " codec=" << anchor.codec->label << " entries=" << anchor.entries
@@ -1395,6 +1475,102 @@ void PrintDumpFNameBlocks(
                 std::cout << "    " << name << " index=0x" << std::hex << index << std::dec << " ("
                           << index << ")\n";
             }
+        }
+    }
+    if (!dense_tables.empty()) {
+        std::cout << "\ndense name tables accepted on local entry density (" << dense_tables.size()
+                  << "): the entries decode, but they are not back to back, so no block chain is claimed"
+                  " and only the pointers below are offered as candidates\n";
+        std::sort(dense_tables.begin(), dense_tables.end(), [](const AnchorHit& left, const AnchorHit& right) {
+            return left.entries > right.entries;
+        });
+        // Several markers hit inside one region, so the candidates overlap. Keep the widest span of each
+        // region only, otherwise the report repeats the same table with different offsets and the reader
+        // cannot tell how many distinct tables the dump really holds.
+        {
+            std::vector<AnchorHit> kept;
+            for (const auto& table : dense_tables) {
+                const auto lo = table.data_va;
+                const auto hi = table.data_va + (table.consumed != 0 ? table.consumed : 1U);
+                const auto overlaps = [lo, hi](const AnchorHit& other) {
+                    const auto other_lo = other.data_va;
+                    const auto other_hi = other.data_va + (other.consumed != 0 ? other.consumed : 1U);
+                    return lo < other_hi && other_lo < hi;
+                };
+                if (std::none_of(kept.begin(), kept.end(), overlaps)) {
+                    kept.push_back(table);
+                }
+            }
+            dense_tables.swap(kept);
+        }
+        if (dense_tables.size() > max_tables) {
+            dense_tables.resize(max_tables);
+        }
+        // One merged pointer pass for every table: a full sweep of the captured ranges is the single
+        // most expensive operation in this command, so per-table sweeps would multiply the runtime.
+        std::vector<std::uint64_t> targets;
+        std::unordered_map<std::uint64_t, std::size_t> owner;
+        for (std::size_t i = 0; i < dense_tables.size(); ++i) {
+            targets.push_back(dense_tables[i].data_va);
+            owner.emplace(dense_tables[i].data_va, i);
+            for (const auto size : kProbeSizes) {
+                if (dense_tables[i].data_va > size) {
+                    targets.push_back(dense_tables[i].data_va - size);
+                    owner.emplace(dense_tables[i].data_va - size, i);
+                }
+            }
+        }
+        std::sort(targets.begin(), targets.end());
+        targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
+        std::vector<std::pair<std::size_t, std::size_t>> ref_counts(dense_tables.size(), {0, 0});
+        if (!targets.empty()) {
+            const auto target_lo = targets.front();
+            const auto target_hi = targets.back();
+            std::size_t total = 0;
+            for (const auto& range : ranges) {
+                if (range.size < 8 || total >= referrer_cap) {
+                    continue;
+                }
+                const auto data = bytes.subspan(
+                    static_cast<std::size_t>(range.file_offset), static_cast<std::size_t>(range.size));
+                for (std::size_t position = 0; position + 8 <= data.size(); position += 8) {
+                    const auto value = U64(data.data() + position);
+                    if (value < target_lo || value > target_hi ||
+                        !std::binary_search(targets.begin(), targets.end(), value)) {
+                        continue;
+                    }
+                    const auto va = range.va + position;
+                    const auto which = owner.find(value);
+                    if (which != owner.end()) {
+                        std::cout << "  table[" << which->second << "] referrer=0x" << std::hex << va
+                                  << " -> 0x" << value << std::dec
+                                  << (in_image(va) ? " [image]" : " [heap]");
+                        if (in_image(va)) {
+                            std::cout << " RVA=0x" << std::hex << (va - image_base) << std::dec;
+                            ++ref_counts[which->second].first;
+                        } else {
+                            ++ref_counts[which->second].second;
+                        }
+                        std::cout << '\n';
+                    }
+                    if (++total >= referrer_cap) {
+                        break;
+                    }
+                }
+            }
+        }
+        for (std::size_t i = 0; i < dense_tables.size(); ++i) {
+            const auto& table = dense_tables[i];
+            std::cout << "  table[" << i << "] base=0x" << std::hex << table.data_va << std::dec
+                      << " entries=" << table.entries << (table.capped ? "+" : "") << " span=0x"
+                      << std::hex << table.consumed << std::dec << " referrers image="
+                      << ref_counts[i].first << " heap=" << ref_counts[i].second << '\n';
+            for (const auto& [name, index] : table.block0_indices) {
+                std::cout << "    wanted name \"" << name << "\" entry_offset=0x" << std::hex
+                          << (index * 2U) << std::dec << '\n';
+            }
+            std::cout << "  measure it: dump-fname-layout <dmp> 0x" << std::hex << table.data_va
+                      << std::dec << " 0x800 512\n";
         }
     }
     if (validated_anchors == 0) {
@@ -1504,56 +1680,21 @@ void PrintDumpFNameBlocks(
 
         // Every captured pointer to the block: an in-image hit is a GNames candidate with a stable RVA,
         // a heap hit is only useful inside this dump.
-        std::vector<std::uint64_t> targets{anchor.data_va};
-        for (const auto size : kProbeSizes) {
-            if (anchor.data_va > size) {
-                targets.push_back(anchor.data_va - size);
-            }
-        }
-        for (const auto& node : chain.blocks) {
-            targets.push_back(node.header_va);
-            targets.push_back(node.data_va);
-        }
-        std::sort(targets.begin(), targets.end());
-        targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
-        const auto target_lo = targets.front();
-        const auto target_hi = targets.back();
         std::size_t image_refs = 0;
         std::size_t heap_refs = 0;
-        for (const auto& range : ranges) {
-            if (range.size < 8) {
-                continue;
-            }
-            const auto data = bytes.subspan(
-                static_cast<std::size_t>(range.file_offset), static_cast<std::size_t>(range.size));
-            for (std::size_t position = 0; position + 8 <= data.size(); position += 8) {
-                const auto value = U64(data.data() + position);
-                if (value < target_lo || value > target_hi) {
-                    continue;
-                }
-                if (!std::binary_search(targets.begin(), targets.end(), value)) {
-                    continue;
-                }
-                const auto va = range.va + position;
-                std::cout << "  referrer=0x" << std::hex << va << " -> 0x" << value << std::dec
-                          << (in_image(va) ? " [image]" : " [heap]");
-                if (in_image(va)) {
-                    std::cout << " RVA=0x" << std::hex << (va - image_base) << std::dec;
-                    ++image_refs;
-                } else {
-                    ++heap_refs;
-                }
-                std::cout << '\n';
-                if (image_refs + heap_refs >= referrer_cap) {
-                    break;
+        {
+            std::vector<std::uint64_t> targets{anchor.data_va};
+            for (const auto size : kProbeSizes) {
+                if (anchor.data_va > size) {
+                    targets.push_back(anchor.data_va - size);
                 }
             }
-            if (image_refs + heap_refs >= referrer_cap) {
-                break;
+            for (const auto& node : chain.blocks) {
+                targets.push_back(node.header_va);
+                targets.push_back(node.data_va);
             }
+            std::tie(image_refs, heap_refs) = SweepReferrers(targets);
         }
-        std::cout << "  referrers image=" << image_refs << " heap=" << heap_refs
-                  << (image_refs + heap_refs >= referrer_cap ? " (cap reached)" : "") << '\n';
 
         const auto block_count = std::max<std::size_t>(chain.blocks.size(), stride_blocks + 1);
         const auto names = chain.total_entries != 0 ? chain.total_entries : stride_entries + anchor.entries;

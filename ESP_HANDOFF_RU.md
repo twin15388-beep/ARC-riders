@@ -368,15 +368,23 @@ ImGui menu можно писать независимо, но оно не дас
 
 https://www.dropbox.com/scl/fi/37w7un59wy4kc3slpw5xs/arc_tool.exe?rlkey=oes20rpmsq1wm7zkvcljap17e&dl=0
 
-Актуальная версия (2026-11-13, `dump-fname-blocks` + `dump-fname-layout` + `live-fname-layout` + `probe`):
+Актуальная версия (2026-11-13, dense-таблицы в `dump-fname-blocks` + обратная цепочка в
+`dump-fname-layout` + `probe`/`probe-write`):
 
 ```text
-Size:    1254912 bytes
-SHA-256: 2e16ad4889561295da240dc362fc125c469e7a36be03af812c9af4e3f3d5080f
-build stamp: 2026-11-13-write-probe
-arc_inject.exe: 958464 bytes
+Size:    1290752 bytes
+SHA-256: 71caa6e5c516136835844b1a8e233e45b50128b70fc80bc230464e4b072234a6
+build stamp: 2026-11-13-fname-tables
+arc_inject.exe (впрыск закрыт измерением, оставлен для полноты): 958464 bytes
 SHA-256: 2ec75e420b7314eebae10394997ebbb054fbb556b9c6bbb5ce0a59924fcfba7e
 ```
+
+Почему это сдвигает FName с мёртвой точки: в дампах `(2)`/`(3)` пул имён виден открытым текстом
+(`IntProperty` на `0xa6f10014` у `(3)`, `0xa7b10014` у `(2)`), но строгий гейт «блок выровнен по
+0x20000 и первая запись = None» его отбраковывал. Новый режим принимает регион по одной локальной
+плотности декодируемых записей и делает по всем таким таблицам один объединённый проход за
+ссылками — строка `[image] RVA=0x...` и есть кандидат на `GNames`. `dump-fname-layout` при этом
+читаёт 0x400 до указанного адреса и цепляет записи назад до начала блока (`block start hint`).
 
 Build выполнен Zig `x86_64-windows-gnu`, C++20, static, strict `-Werror`, exit code `0`. Portable core tests прошли. FNamePool scan на реальном dump ещё не запускался из-за запуска пользователем старого EXE. Ничего не проверено в live game.
 

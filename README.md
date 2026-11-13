@@ -48,6 +48,15 @@ Unreal core classes in this mapping use names such as `World`, `Actor`, `Object`
 
 ### FName pool recovery from a block anchor
 
+When the strict block chain cannot be validated, the same command now also reports *dense name
+tables*: regions whose entries each decode under the measured header but do not follow each other back
+to back. Every such table gets one merged pointer sweep over the whole dump, so an `[image]` referrer
+line directly yields a `GNames` candidate RVA. `dump-fname-layout <dmp> <va> <window>` reads 0x400 bytes
+*before* `<va>` and chains entries backwards to the start of the block (packed-stream measurement,
+per-entry `hdr/size/pad`, entry-size histogram, and a `block start hint=0x...` line with a follow-up
+command). This is what handles the normal case where a marker search lands in the middle of a pool
+block, and it is the path to use when `dump-fname-blocks` reports `anchors=0` but prints a dense table.
+
 `dump-fname-blocks` starts from data that can be read instead of from a guessed global address: it
 locates the pool block whose first entry decodes as `None`, identifies the block header by checking
 which candidate offset makes the following pointer land on another decodable block, walks the block
