@@ -237,6 +237,9 @@ Dumper-7 на главном меню, чтобы имена классов до
 дошёл: `Start-Process -Verb RunAs` в Windows PowerShell 5.1 нельзя совместить с `-RedirectStandardOutput`
 (`AmbiguousParameterSet`), редирект делается через `cmd /c` в повышенном окне.
 
+Папка дампера расшарена: `https://www.dropbox.com/scl/fo/kq6ljvcejbaipxll5qsw1/AFMfXcOvAjGi-FCuchmoys4?rlkey=udmmrpb1q03s724ghebppdq9u&dl=1`
+(качает zip папки, внутри обновлённый `arc_inject.exe` + `Dumper-7.dll` + `Dumper-7.ini` + `README.txt`).
+
 Сборки в Dropbox: `/arc_tool.exe` `1 250 304` байта, sha256
 `d29c7d6afcb9d9a840a5e2de38dc9366099226b2c702ba2d48cc3f2533daa04f`, stamp `2026-11-13-markers-priv`,
 rev `66026fc83cc584b309220`. Локально в репозитории те же файлы — `out/arc_tool.exe`, `out/arc_inject.exe`

@@ -161,6 +161,13 @@ same bytes as the file inside the zip. `arc_tool.exe` build `2026-11-13-markers-
 sha256 `d29c7d6afcb9d9a840a5e2de38dc9366099226b2c702ba2d48cc3f2533daa04f`, rev `66026fc83cc584b309220`.
 Core tests pass strict and under ASan/UBSan; nothing has been run in game.
 
+The Dumper-7 folder is now shared as a link so the fixed injector travels with the DLL it must match:
+`https://www.dropbox.com/scl/fo/kq6ljvcejbaipxll5qsw1/AFMfXcOvAjGi-FCuchmoys4?rlkey=udmmrpb1q03s724ghebppdq9u&dl=1`.
+The `probe` follow-up needs an elevated console *and* a redirect, which Windows PowerShell 5.1 cannot
+combine on one `Start-Process` (`-Verb RunAs` with `-RedirectStandardOutput` fails with
+`AmbiguousParameterSet`); the working form is `Start-Process cmd -Verb RunAs -Wait -ArgumentList
+'/c',"<tool> probe <pid> > <file> 2>&1"`.
+
 ## Shortest next verification step
 
 Hex-dump 0x400 bytes at step0, 0x500 at step1, 0x300 at step2, 0x600 at step3, and 0x20 at `0x150421C80` (public viewport key-material candidate). Validate vtables, controller/local-player relationships, world/level/game-instance pointers and the encrypted viewport bank. No ESP or gameplay reads until these checks succeed.
