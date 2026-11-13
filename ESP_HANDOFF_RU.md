@@ -372,9 +372,9 @@ https://www.dropbox.com/scl/fi/37w7un59wy4kc3slpw5xs/arc_tool.exe?rlkey=oes20rpm
 `dump-fname-layout` + `probe`/`probe-write`):
 
 ```text
-Size:    1299968 bytes
-SHA-256: 5b17b9ca8012e0ad57df3bd9aa687be873a3bff310f4951c43b86c2b15633d60
-build stamp: 2026-11-13-packed-pool
+Size:    1309184 bytes
+SHA-256: 51a614bf3a8f0d6d07ff01d834ab84732bbb7a82af2ef622e7ec3fb59ab60acc
+build stamp: 2026-11-13-pool-follow
 arc_inject.exe (впрыск закрыт измерением, оставлен для полноты): 958464 bytes
 SHA-256: 2ec75e420b7314eebae10394997ebbb054fbb556b9c6bbb5ce0a59924fcfba7e
 ```
@@ -385,6 +385,19 @@ SHA-256: 2ec75e420b7314eebae10394997ebbb054fbb556b9c6bbb5ce0a59924fcfba7e
 `private_region_reads=5 of 5` и 77 модулей. То есть доступ к чтению живого процесса НЕ гарантирован и
 зависит от момента замера — офлайн-дампы остаются единственным надёжным путём, на решения это не
 влияет (имена всё равно восстанавливаются из `.DMP`).
+
+'Шестой прогон — пул Валидирован на реальном дампе `(3)`: `anchor block_data=0xa6f10000
+codec=packed_shift6_no_terminator entries=366 consumed=0x159a`, ординалы `Actor=57, Pawn=63,
+PersistentLevel=81` (block 0), referrer `0x7fff725aeb90 -> 0xa6f10000 [heap]`. Цепочка обрывается на
++0x159a (не выровненный хвост — внутри блока есть запись неизвестного вида, главный подозреваемый —
+wide), stride +0x10000 не дал block 1 (блоки аллоцированы раздельно). Ответ на это даёт сборка
+`2026-11-13-pool-follow`: явный `anchor=0xa6f10000` (проход без маркерного скана, ~5–15 мин) печатает
+`stop context` (hex на месте обрыва), `resync` (перезапуск цепочки после обрыва и размер пропуска) и
+`pointer-array hunt` вокруг каждого referrer: прогоняет qwords окна ±0x1000 ищет максимальный прогон
+указателей на декодируемые блоки (шаг 0x8) — это таблица блоков FNamePool; по найденному массиву
+пересчитывает ординалы wanted-имён по всему пулу и помечает массив RVA-кандидатом если он в образе.
+Ординалы до resync'а — нижняя граница (в выводе это сказано явно). Синтетика `syn_pack` прогоняется
+зелёно в обоих режимах (discover и explicit anchor) под ASan/UBSan.
 
 Пятый прогон (дампы нашлись в `C:\Users\Malin\AppData\Local\Temp`) дал решающее измерение:
 `dump-read (3) 0xa6f10000 0x80` показывает формат записи — `u16 заголовок (len<<6 | чётные младшие

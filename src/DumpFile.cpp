@@ -1456,7 +1456,8 @@ void PrintDumpFNameBlocks(
     }
     // Every captured pointer to a candidate region: an in-image hit is a GNames candidate with a stable
     // RVA, a heap hit is only useful inside this dump.
-    const auto SweepReferrers = [&](const std::vector<std::uint64_t>& wanted) {
+    const auto SweepReferrers = [&](const std::vector<std::uint64_t>& wanted,
+                                    std::vector<std::uint64_t>* out_vas = nullptr) {
         auto targets = wanted;
         std::sort(targets.begin(), targets.end());
         targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
@@ -1484,6 +1485,9 @@ void PrintDumpFNameBlocks(
                 const auto va = range.va + position;
                 std::cout << "  referrer=0x" << std::hex << va << " -> 0x" << value << std::dec
                           << (in_image(va) ? " [image]" : " [heap]");
+                if (out_vas != nullptr) {
+                    out_vas->push_back(va);
+                }
                 if (in_image(va)) {
                     std::cout << " RVA=0x" << std::hex << (va - image_base) << std::dec;
                     ++image_hits;
@@ -1683,6 +1687,48 @@ void PrintDumpFNameBlocks(
                          " the pool is not a plain FBlockInfo chain in this build\n";
         }
 
+        // Why the chained walk stopped inside a half-empty block is the one fact that decides the
+        // rest of the layout work. Print the exact bytes at the stop, then look forward for the next
+        // position from which at least four entries chain - the distance and the skipped bytes name
+        // whatever entry form the codec does not model yet (a wide name is the prime suspect).
+        std::size_t resync_gap = 0;
+        std::vector<std::pair<std::uint32_t, std::string>> resync_names;
+        {
+            const auto win = read(anchor.data_va, block_size);
+            if (win && anchor.entries != 0 && anchor.consumed != 0 && anchor.consumed < win->size()) {
+                const std::size_t stop = anchor.consumed;
+                const auto from = stop > 0x20 ? stop - 0x20 : std::size_t{0};
+                const auto to = std::min<std::size_t>(stop + 0x60, win->size());
+                std::cout << "  stop context (walk ended at +" << std::hex << stop << std::dec
+                          << "; bytes before/after):\n";
+                PrintHexWindow("stop", std::span<const std::uint8_t>(win->data() + from, to - from));
+                for (std::size_t off = stop + 2; off + 0x40 <= win->size(); off += 2) {
+                    const auto probe = WalkNameBlock({win->data() + off, win->size() - off}, *anchor.codec, 8);
+                    if (probe.entries.size() < 4) {
+                        continue;
+                    }
+                    resync_gap = off - stop;
+                    for (const auto& entry : probe.entries) {
+                        resync_names.emplace_back(entry.offset, entry.text);
+                    }
+                    break;
+                }
+                if (resync_names.empty()) {
+                    std::cout << "  resync: no 4-entry chain restarts within this block after the stop -"
+                                 " the rest of the block is not packed names, so block 0 ends here and"
+                                 " later blocks live elsewhere\n";
+                } else {
+                    std::cout << "  resync at +" << std::hex << (stop + resync_gap) << " skipped=0x"
+                              << resync_gap << std::dec << " names:";
+                    for (const auto& [name_off, name] : resync_names) {
+                        std::cout << " \"" << name << "\"";
+                    }
+                    std::cout << "\n  the skipped bytes are one or more entries in a form the packed"
+                                 " codec does not model; ordinals past the stop are lower bounds\n";
+                }
+            }
+        }
+
         // Second allocator shape: blocks laid out back to back instead of chained through headers.
         // When the winning codec is the packed pool form, also test half the configured step: real
         // FNamePool blocks are 0x10000 apart while the scan probes a coarser grid.
@@ -1744,6 +1790,7 @@ void PrintDumpFNameBlocks(
         // a heap hit is only useful inside this dump.
         std::size_t image_refs = 0;
         std::size_t heap_refs = 0;
+        std::vector<std::uint64_t> referrer_vas;
         {
             std::vector<std::uint64_t> targets{anchor.data_va};
             for (const auto size : kProbeSizes) {
@@ -1755,7 +1802,104 @@ void PrintDumpFNameBlocks(
                 targets.push_back(node.header_va);
                 targets.push_back(node.data_va);
             }
-            std::tie(image_refs, heap_refs) = SweepReferrers(targets);
+            std::tie(image_refs, heap_refs) = SweepReferrers(targets, &referrer_vas);
+        }
+
+        // The full sweep printed one pointer per referrer line; the pool's block table sits right
+        // around those pointers. Every qword in a window around each referrer that opens a 4+ entry
+        // packed stream is a block pointer; a maximal run of such qwords at stride 0x8 IS the block
+        // array, and walking it in array order is the only ordinal-correct way to cover the pool.
+        std::vector<std::uint64_t> pool_blocks;
+        if (!referrer_vas.empty() && anchor.codec != nullptr) {
+            std::cout << "  pointer-array hunt around " << referrer_vas.size() << " referrer(s):\n";
+            std::set<std::uint64_t> probed;
+            for (std::size_t ri = 0; ri < referrer_vas.size() && ri < 8; ++ri) {
+                const auto r = referrer_vas[ri];
+                if (r < 0x1000) {
+                    continue;
+                }
+                const auto win = read(r - 0x100, 0x1000);
+                if (!win || win->size() < 0x200) {
+                    std::cout << "    referrer=0x" << std::hex << r << std::dec << " window uncaptured\n";
+                    continue;
+                }
+                std::vector<std::pair<std::size_t, std::uint64_t>> good;
+                for (std::size_t pos = 0; pos + 8 <= win->size(); pos += 8) {
+                    const auto q = U64(win->data() + pos);
+                    if (q < 0x10000 || !probed.insert(q).second) {
+                        continue;
+                    }
+                    const auto probe = read(q, 0x100);
+                    if (!probe || probe->size() < 0x40) {
+                        continue;
+                    }
+                    const auto w = WalkNameBlock(*probe, *anchor.codec, 8);
+                    if (w.entries.size() >= 4) {
+                        good.emplace_back(pos, q);
+                    }
+                }
+                std::size_t best_len = 0;
+                std::size_t best_at = 0;
+                for (std::size_t i = 0; i < good.size();) {
+                    std::size_t j = i + 1;
+                    while (j < good.size() && good[j].first == good[i].first + (j - i) * 8) {
+                        ++j;
+                    }
+                    if (j - i > best_len) {
+                        best_len = j - i;
+                        best_at = i;
+                    }
+                    i = j == i ? i + 1 : j;
+                }
+                const auto rv = r - 0x100;
+                std::cout << "    referrer=0x" << std::hex << r << " window=0x" << rv << std::dec
+                          << " block_like_ptrs=" << good.size() << " longest_stride8_run=" << best_len
+                          << '\n';
+                if (best_len < 2) {
+                    continue;
+                }
+                const auto array_va = rv + good[best_at].first;
+                std::cout << "    block_array=0x" << std::hex << array_va << std::dec << " count="
+                          << best_len << (in_image(array_va)
+                                              ? " [image] - RVA candidate for the FNamePool block table"
+                                              : " [heap]")
+                          << '\n';
+                pool_blocks.clear();
+                for (std::size_t i = 0; i < best_len; ++i) {
+                    pool_blocks.push_back(good[best_at + i].second);
+                }
+                std::uint32_t running = 0;
+                std::vector<std::pair<std::string, std::uint32_t>> pool_wanted;
+                for (std::size_t i = 0; i < pool_blocks.size() && i < 64; ++i) {
+                    const auto blk = read(pool_blocks[i], block_size);
+                    if (!blk) {
+                        std::cout << "      block[" << i << "] at 0x" << std::hex << pool_blocks[i]
+                                  << std::dec << " uncaptured\n";
+                        break;
+                    }
+                    const auto walk = WalkNameBlock(*blk, *anchor.codec, entry_cap);
+                    std::uint32_t local = 0;
+                    for (const auto& entry : walk.entries) {
+                        for (const auto wanted : kWantedNames) {
+                            if (entry.text == wanted) {
+                                pool_wanted.emplace_back(std::string(wanted), running + local);
+                            }
+                        }
+                        ++local;
+                    }
+                    std::cout << "      block[" << i << "]=0x" << std::hex << pool_blocks[i] << std::dec
+                              << " entries=" << walk.entries.size() << " first=\""
+                              << (walk.entries.empty() ? "" : walk.entries.front().text) << "\" last=\""
+                              << (walk.entries.empty() ? "" : walk.entries.back().text) << "\"\n";
+                    running += static_cast<std::uint32_t>(walk.entries.size());
+                }
+                std::cout << "      pool_names>=" << running << " (array order, lower bound where a"
+                          << " block stops mid-window)\n";
+                for (const auto& [name, ordinal] : pool_wanted) {
+                    std::cout << "      " << name << " ordinal=" << ordinal << '\n';
+                }
+                break;
+            }
         }
 
         const auto block_count = std::max<std::size_t>(chain.blocks.size(), stride_blocks + 1);
