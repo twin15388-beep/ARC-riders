@@ -658,6 +658,12 @@ void TestEspConfigAndRows() {
         "trigger fires far outside the box");
     Check(!rows[1].projected || !arc::IsOnAimPoint(rows[1], -1.0, -1.0, 0.0), "trigger fires off-screen");
 
+    const auto demo = arc::DemoOverlayData();
+    Check(demo.rfind("window.ARC = ", 0) == 0, "demo data is not a js assignment");
+    Check(demo.find("\"actors_with_position\": 12") != std::string::npos, "demo rows missing");
+    Check(demo.find("\"hp\": ") != std::string::npos && demo.find("\"team\": ") != std::string::npos,
+        "demo rows carry no health or team");
+
     const auto page = arc::OverlayHtml();
     Check(page.find("window.ARC") != std::string::npos, "overlay does not read the exported data");
     Check(page.find("<canvas") != std::string::npos, "overlay has no canvas");

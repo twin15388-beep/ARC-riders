@@ -57,7 +57,8 @@ void Usage() {
         << "arc_tool dump-read <game.dmp> <VA> <size>  Hex-dump up to 4096 bytes\n"
         << "arc_tool esp-actors <game.dmp> <base> <size> [min_num] [out.ini]  Sweep captured memory for\n"
         << "                                         the actor array and derive positions from it\n"
-        << "arc_tool esp-overlay <out.html>            Write the viewer for esp-export's esp-data.js\n"
+        << "arc_tool esp-overlay <out.html> [demo]     Write the viewer for esp-export's esp-data.js;\n"
+        << "                                             demo also writes a synthetic esp-data.js to open now\n"
         << "arc_tool esp-config <out.ini>                Write a fillable [esp] offset config\n"
         << "arc_tool esp-export <game.dmp> <base> <size> <config.ini> [out.js] [rows]  Export actors\n"
         << "                                         with distance and world-to-screen for an overlay\n"
@@ -289,6 +290,17 @@ int main(int argc, char** argv) {
             out << arc::OverlayHtml();
             std::cout << "overlay written to " << argv[2]
                       << "\nopen it in a browser and keep esp-data.js in the same folder\n";
+            if (argc == 4 && std::string_view(argv[3]) == "demo") {
+                // A folder next to the html: the page draws a dozen synthetic actors, which is how to tell
+                // "the renderer is fine" apart from "the offsets are wrong".
+                const std::filesystem::path data{std::filesystem::path(argv[2]).parent_path() /
+                    "esp-data.js"};
+                std::ofstream js(data.string());
+                if (js) {
+                    js << arc::DemoOverlayData();
+                    std::cout << "demo esp-data.js written next to it - open " << argv[2] << " to see boxes\n";
+                }
+            }
             return 0;
         }
         if (argc == 3 && std::string_view(argv[1]) == "esp-config") {

@@ -444,9 +444,9 @@ https://www.dropbox.com/scl/fi/37w7un59wy4kc3slpw5xs/arc_tool.exe?rlkey=oes20rpm
 `dump-fname-layout`, `probe`/`probe-write`):
 
 ```text
-Size:    1445376 bytes
-SHA-256: 8648746873a50a7760b635647d56e315e0b5028547dea754f736a5d0184dfc18
-build stamp: 2026-11-13-esp3  (Dropbox rev см. ниже)  <- слой функций §13
+Size:    1447424 bytes
+SHA-256: e3a5531168a5ea89181f751b3d761aeef25bd8976eea3f4d71f69e8db3b82ed2
+build stamp: 2026-11-13-esp3  (Dropbox rev 6602d6618d4f24b309220)  <- слой функций §13
 предыдущая: 1401344 / e29d482e316fb8d6f55dd99bc7ed81a3d75e8e29ec9ddc27f26f9ec01f61651c / 2026-11-13-esp2
 предыдущая: 1364480 / e7d7097d5a451158d84aff92d4c7a035802d36a2d35d033bbecd272ae8d35ca0 / 2026-11-13-esp1
 предыдущая: 1342976 / e77e85b598e0e240ce2a92aa2427d1450059490c4dbc87bfdd046d6aa87713e0 / 2026-11-13-hunt2
@@ -703,8 +703,15 @@ like coordinates)` вместо ложного «consistent with a real actor li
 ```text
 esp-config  <out.ini>                     пустой [esp]-шаблон со всеми ключами и комментариями
 esp-export  <dmp> <base> <size> <cfg.ini> [out.js|out.json] [rows]
-esp-overlay <out.html>                    просмотрщик для esp-data.js
+esp-overlay <out.html> [demo]             просмотрщик для esp-data.js; demo дописывает рядом
+                                          синтетический esp-data.js, чтобы страницу можно было открыть сразу
 ```
+
+`DemoOverlayData()` — 12 актёров на окружности, прогнанных через тот же `WorldToScreen`, что и экспорт.
+Страница прогнана под node с заглушкой canvas: 12 коробок и 12 подписи за кадр, HUD печатает
+`12 of 12 actors carry a position`. Это separating evidence: если демо рисуется, а реальный экспорт пуст —
+не хватает оффсетов, а не рендера. Сам HTML лежит в `src/Esp.cpp` одной raw-строкой, поэтому бинарь
+остаётся одним файлом и `esp-overlay` не требует скачивать что-то ещё.
 
 `esp-export` сам добирается до массива актёров: если в ini есть `actor_array_data`/`actor_array_num`
 (их пишет `esp-actors` и `esp-chain`) — использует их; если есть `world_va` — читает

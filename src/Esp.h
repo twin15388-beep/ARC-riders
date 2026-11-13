@@ -166,6 +166,11 @@ struct AimPick {
 [[nodiscard]] std::string ToJson(const std::vector<EspActor>& rows, const EspOffsetSet& offsets,
     std::size_t total_actors, bool as_js, std::string_view note);
 
+// A ready-made esp-data.js with a dozen actors placed on a circle, projected by the same WorldToScreen the
+// exporter uses. It exists so the overlay can be opened and seen to work before any offset is known: if the
+// page draws boxes, the reader, the maths and the renderer are fine and only the offsets are missing.
+[[nodiscard]] std::string DemoOverlayData();
+
 // The overlay page that consumes ToJson's output. Emitted by the tool rather than kept as a separate asset
 // so `arc_tool esp-overlay <out.html>` plus `esp-export ... esp-data.js` in one folder is the whole setup.
 [[nodiscard]] std::string OverlayHtml();

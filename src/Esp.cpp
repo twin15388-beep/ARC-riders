@@ -501,6 +501,37 @@ std::string ToJson(const std::vector<EspActor>& rows, const EspOffsetSet& offset
     return "window.ARC = " + out.str() + ";\n";
 }
 
+std::string DemoOverlayData() {
+    EspOffsetSet offsets;
+    offsets.screen_width = 1920;
+    offsets.screen_height = 1080;
+    offsets.fov_degrees = 90.0;
+    offsets.actor_radius_cm = 85.0;
+    offsets.relative_location_off = 0x11C;   // only echoed into the json, nothing is read here
+    offsets.root_component_off = 0x130;
+
+    const Viewport view = offsets.ScreenView();
+    std::vector<EspActor> rows;
+    for (std::size_t i = 0; i < 12; ++i) {
+        const double angle = static_cast<double>(i) / 12.0 * 6.283185307179586;
+        EspActor row;
+        row.address = 0x1000 + i * 0x10;
+        row.position = FVector{2500.0 + 900.0 * std::cos(angle), 1800.0 * std::sin(angle), 100.0 + 60.0 * i};
+        row.distance_m = DistanceMetres(offsets.local_origin, row.position);
+        double depth = 0.0;
+        row.projected = WorldToScreen(row.position, view, &row.screen_x, &row.screen_y, &depth);
+        row.box_half_height = row.projected ? ScreenRadiusPixels(depth, offsets.actor_radius_cm, view) : 0.0;
+        row.has_health = true;
+        row.health = static_cast<float>(38 + 9 * i);
+        row.max_health = 100.0F;
+        row.has_team = true;
+        row.team = static_cast<std::uint32_t>(i % 3);
+        rows.push_back(row);
+    }
+    return ToJson(rows, offsets, rows.size(), true,
+        "demo data: the overlay, the projection and the reader work; these actors are not real");
+}
+
 std::string OverlayHtml() {
     // A single file with no dependencies: it loads `esp-data.js` (the file `esp-export` writes when the
     // output name ends in .js), redraws on a timer, and shows what it is waiting for. The reason it reads a

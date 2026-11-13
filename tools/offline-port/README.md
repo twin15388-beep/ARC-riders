@@ -16,5 +16,9 @@ spread position, and a 128 element **decoy** array of objects with no positions.
 that matters: any "array of object pointers" heuristic accepts it, so `run.sh` fails if the ranking ever
 stops rejecting it.
 
+`esp-export` is gated here too: `run.sh` feeds the ini written by `esp-actors` (and a hand-written one)
+back into the exporter and compares the exported coordinates and distances against the same ground truth,
+so the feature layer cannot rot without the gate noticing.
+
 Real dumps are never put here. `out/arc_tool.exe` is built with `python3 -m ziglang c++ -target
 x86_64-windows-gnu` from the same sources; this harness only proves the predicates do what they claim.
