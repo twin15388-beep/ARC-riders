@@ -63,6 +63,15 @@ void PrintDumpFNameLayout(
 // first entry is one of `marker_list` (comma separated, defaults to engine-core names beginning with
 // "None"). The point of the marker list is that "no block starts with None" was already measured, so a
 // single-marker search cannot tell a wrong codec apart from a region the dump never captured.
+// Derives the ESP data path (UWorld/ULevel round trip, actor array, component and position offsets) from
+// a minidump using structural predicates only, so it does not depend on the FName pool or on class names.
+void PrintDumpEspChain(
+    const std::filesystem::path& path,
+    std::uint64_t image_base,
+    std::uint64_t image_size,
+    std::uint64_t global_rva,
+    std::string_view chain_list,
+    const std::filesystem::path& ini_out = {});
 void PrintDumpFNameBlocks(
     const std::filesystem::path& path,
     std::uint64_t image_base,

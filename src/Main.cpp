@@ -45,6 +45,9 @@ void Usage() {
         << "arc_tool version                          Print the embedded build stamp\n"
         << "arc_tool dump-scan <game.dmp> <AOB>      Find an AOB pattern in captured memory\n"
         << "arc_tool dump-read <game.dmp> <VA> <size>  Hex-dump up to 4096 bytes\n"
+        << "arc_tool esp-chain <game.dmp> <base> <size> [global_rva] [\"chain\"] [out.ini]  Derive\n"
+        << "                                         the ESP object graph from a dump by structural\n"
+        << "                                         tests (defaults: 0x108FEEC0, \"0xA0,0x250,0x160\")\n"
         << "arc_tool dump-chain <game.dmp> <VA> [offset ...]  Read pointer, then pointer+offset steps\n"
         << "arc_tool dump-chain-scan <game.dmp> <base> <image_size> <offset ...>  Find captured chains\n"
         << "arc_tool dump-gnames <game.dmp> <base> <image_size>  Validate FNamePool candidates\n"
@@ -259,6 +262,38 @@ int main(int argc, char** argv) {
             arc::PrintDumpFNameBlocks(argv[2], arc::ParseUnsigned(argv[3]), arc::ParseUnsigned(argv[4]),
                 anchor, static_cast<std::uint32_t>(block_size), static_cast<std::uint32_t>(min_entries),
                 static_cast<std::size_t>(max_blocks), marker_list, names_out);
+            return 0;
+        }
+        if (argc >= 4 && std::string_view(argv[1]) == "esp-chain") {
+            // esp-chain <game.dmp> <base> <image_size> [global_rva] [off1,off2,...] [out.ini]
+            // Trailing arguments are classified by shape, not by position: PowerShell drops an empty
+            // "" positional, so "skip the chain, keep the ini" has to work without a placeholder.
+            std::uint64_t global_rva = 0x108FEEC0;
+            bool have_rva = false;
+            std::string_view chain_list;
+            std::filesystem::path ini_out;
+            for (int i = 5; i < argc; ++i) {
+                const std::string_view arg{argv[i]};
+                if (arg.size() > 4 && arg.compare(arg.size() - 4, 4, ".ini") == 0) {
+                    ini_out = arg;
+                    continue;
+                }
+                if (arg.find(',') != std::string_view::npos) {
+                    chain_list = arg;  // "0xA0,0x250,0x160" - quote it, PowerShell splits on spaces
+                    continue;
+                }
+                if (!have_rva) {
+                    try {
+                        global_rva = arc::ParseUnsigned(arg);
+                        have_rva = true;
+                        continue;
+                    } catch (const std::exception&) {
+                    }
+                }
+                chain_list = arg;  // a single offset with no comma, e.g. "0x250"
+            }
+            arc::PrintDumpEspChain(argv[2], arc::ParseUnsigned(argv[3]), arc::ParseUnsigned(argv[4]),
+                global_rva, chain_list, ini_out);
             return 0;
         }
         if (argc == 3 && std::string_view(argv[1]) == "probe") {

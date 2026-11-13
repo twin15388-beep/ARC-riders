@@ -439,13 +439,15 @@ ImGui menu можно писать независимо, но оно не дас
 
 https://www.dropbox.com/scl/fi/37w7un59wy4kc3slpw5xs/arc_tool.exe?rlkey=oes20rpmsq1wm7zkvcljap17e&dl=0
 
-Актуальная версия (2026-11-13, dense-таблицы в `dump-fname-blocks` + обратная цепочка в
-`dump-fname-layout` + `probe`/`probe-write`):
+Актуальная версия (2026-11-13, режим `esp-chain` — вывод offset'ов ESP из дампа структурными
+предикатами; внутри также dense-таблицы в `dump-fname-blocks`, обратная цепочка в
+`dump-fname-layout`, `probe`/`probe-write`):
 
 ```text
-Size:    1342976 bytes
-SHA-256: e77e85b598e0e240ce2a92aa2427d1450059490c4dbc87bfdd046d6aa87713e0
-build stamp: 2026-11-13-hunt2  (Dropbox rev 6602a8b610c124b309220)
+Size:    1364480 bytes
+SHA-256: e7d7097d5a451158d84aff92d4c7a035802d36a2d35d033bbecd272ae8d35ca0
+build stamp: 2026-11-13-esp1  (Dropbox rev 6602ae139d1644b309220)
+предыдущая: 1342976 / e77e85b598e0e240ce2a92aa2427d1450059490c4dbc87bfdd046d6aa87713e0 / 2026-11-13-hunt2
 arc_inject.exe (впрыск закрыт измерением, оставлен для полноты): 958464 bytes
 SHA-256: 2ec75e420b7314eebae10394997ebbb054fbb556b9c6bbb5ce0a59924fcfba7e
 ```
@@ -504,3 +506,104 @@ PowerShell:
 cd "$env:USERPROFILE\Downloads"
 Get-FileHash .\arc_tool.exe -Algorithm SHA256
 ```
+
+---
+
+## 12. `esp-chain`: вывод offset'ов из дампа без имён и без live-процесса (2026-11-13)
+
+### Почему этот режим вообще появился
+
+Публичные рабочие решалы по ARC Raiders (смотрели по прямой просьбе «чекни гитхаб»):
+
+| репо | что внутри | вердикт |
+|---|---|---|
+| `xmodius/ArcRaiders-DMA-Dumper-v2` (12★, 2025-11-09) | «dumper» на MemProcFS, но offset'ы **хардкодом** (`GWorld=0x80E9950`, `PersistentLevel=0x38`, `AActors=0xA0`, `RelativeLocation=0x128`), проверка одна: `read(base+off) > 0x10000`, и те же константы обратно в `Offsets_Dumped.h` | переиспользовать нечего; его `PersistentLevel=0x38` противоречит второму репо (`0xE8`) — не считать вторым мнением |
+| `a0yark/ArcRaidersRadar-dma-Radar` (23★, 2025-12-24) | `src/offsets.h` + `src/emu.cpp`: `GWorld` **не является обычным глобальным указателем** — это результат расшифровщика-чанка кода (`GWorld 0x4F80DFC..0x4F80EF4`, `GameInstance 0x2A5891F..0x2A58953`, `CameraManager 0x2A66AE9..0x2A66BF9`, `BoneBase 0x3076D50..0x3076E64`), который они исполняют в Unicorn с хуком на невалидную память (страницы дочитываются из живого процесса). Сам радар — заглушка (`// TODO: Add radar rendering logic here`), ценность = offset'ы + способ нахождения GWorld | единственный дешёвый валидатор, который у них есть: `read(uworld+0xE8)=L && read(L+0xE8)==uworld`. Это и есть структурный предикат, а не поиск по имени |
+
+Отсюда два вывода, которые меняют план:
+
+1. охота за «прямым `GWorld`/`GNames` в образе» — неверная модель этой игры, у глобалов нет статичного
+   значения без выполнения чанка; наш путь «структурный граф из дампа» как раз не требует ни глобала,
+   ни декодера;
+2. класс имени не нужен вообще: UWorld/ULevel узнают друг друга по взаимной ссылке, TArray актёров
+   опознаётся по трём qword'ам и «все элементы — объекты», позиция — голосованием по всем актёрам
+   сразу. Ни один неверный offset не проходит ни один из этих предикатов, поэтому режим можно
+   запускать на дампе и доверять строке `HIT`/`FAIL`.
+
+Их декабрьские значения (для `pe_timestamp 0x6AEB721B` **не проверены**, арбитраж — только наше
+голосование): `UWorld::PersistentLevel=0xE8`, `ULevel::OwningWorld=0xE8`, `ULevel::Actors=0x98` /
+`ActorsCount=0xA0`, `UGameInstance::LocalPlayers=0x140`, `UPlayer::PlayerController=0x30`,
+`APlayerController::AcknowledgedPawn=0x2A0` / `PlayerCameraManager=0x2D0`, `APawn::PlayerState=0x240` /
+`RootComponent=0x130`, `USceneComponent::RelativeLocation=0x11C`.
+
+### Что делает режим
+
+```text
+arc_tool esp-chain <game.dmp> <base> <image_size> [global_rva=0x108FEEC0] ["0xA0,0x250,0x160"] [out.ini]
+```
+
+Четыре стадии, каждая печатает `HIT` или явный `FAIL`:
+
+1. **цепочка** — идёт `[base+global_rva] -> [+0xA0] -> [+0x250] -> [+0x160]`, для каждого объекта
+   печатает vtable и вердикт `object_header=yes/NO` (vtable внутри образа = тот же предикат, что
+   подтвердил четыре стабильных vtable в §4);
+2. **UWorld/ULevel** — для каждого объекта цепочки и каждого `a` из
+   `0x28,0x30,0x38,0x40,0x98,0xA0,0xE8,0xF0,0xF8,0x100,0x108,0x110,0x140,0x160` принимает пару, если
+   `read(world+a)=level` и `read(level+b)=world` для некоторого  `b` из того же списка;
+3. **массив актёров** — свип `level+0x20..0x400` шагом 8 в поиске `{Data,Num,Max}`, где 6 выбранных
+   элементов подряд все проходят `LooksLikeObject`;
+4. **позиция** — по N актёрам собираются **все** кандидаты `(actor+off -> component)`,
+   `component+off -> FVector` (полоса: никакой ноль, `1.0e-2..1.0e6` по каждой оси, иначе это
+   пол-указателя), и выигрывает большинство; затем второй проход читает координаты уже на победившей
+   паре и печатает разброс по осям.
+
+Пишет `[esp]` в ini: `image_base`, `global_rva`, `chain`, `world`, `persistent_level_off`, `level`,
+`level_owning_world_off`, `level_actors_off`, `root_component_off`, `relative_location_off`, и
+после всего — одну строку `[read path]` со всей цепочкой чтения целиком.
+
+### Валидация (офлайн, синтетика)
+
+`syn_esp.dmp` (139356 B) — дамп, собранный генератором под эти предикаты: образ держит глобал и
+vtable'ы, куча — 4 объекта цепочки, круг UWorld/ULevel (`world+0x38 -> level`, `level+0xe8 -> world`),
+`TArray {data,4,4}` в `level+0xA0`, у 4 актёров `+0x130 -> component -> +0x11C` со z-высотой 20..23.
+Прогон печатал ровно правду: `component-offset votes: +0x130=7/4`, `location-offset votes: +0x11c=9/4`,
+`positions at the winning offsets: 4/4`, `winner: [actor+0x130] -> component,
+[component+0x11c] -> FVector`, `persistent_level_off = 0x38`, `level_actors_off = 0xa0`.
+
+Три ветки отказа проверены тем же прогоном: неверная цепочка -> `FAIL: chain step +0x... is null or
+uncaptured` (со ссылкой на 5-й позиционный аргумент), несхваченный глобал -> `FAIL: the global at
+base+0x... is not captured in this dump`, пустой дамп-адрес -> `no round trip in 0x28..0x160`.
+
+### Ловушка, которую починил второй проход
+
+Первая версия голосовала «первым подходящим offset'ом» на актёра и выбирала `+0x100` вместо
+`+0x11C`: младшая половина чужого vtable-указателя читается как субнормальные float'ы и проходила
+старую полосу `>= 1.0e-3F`. Теперь (а) ровно ноль по любой оси = отказ, (б) полоса `1.0e-2..1.0e6`,
+(в) собираются все пары `(component_off, location_off)` и ранжируются большинством, (г) координаты
+дочитываются на победившей паре и печатается разброс — реальный уровень даёт тысячи юнитов по X/Y,
+мусор даёт узкую полосу. `port`-харнесс собран с `-Wall -Wextra -Wpedantic -Werror`, чистый кросс-билд
+Zig `x86_64-windows-gnu`, `tests/CoreTests.cpp` — `All core checks passed`.
+
+### Ожидание от первого реального прогона
+
+На `(3).DMP` возможны три исхода, и все три — ответ, а не шаг назад:
+
+* `HIT world=... +0x?? -> level=...` на стадии 2 → массив актёров найден, offset'ов FNamePool для ESP
+  больше не нужно вовсе, это разблокирует список юнитов;
+* `object_header=NO` на объектах цепочки → цепочка ведёт не в UWorld, тогда надо сместить
+  `global_rva`/`chain`, и `dump-chain-scan` (§4) уже умеет искать alternatives;
+* `no round trip in 0x28..0x160` → либо конец цепочки не мир, либо взаимная ссылка обфусцирована;
+  следующий шаг тогда — эмпирический перенос их `0xE8` (проверка одной парой, а не 14×14).
+
+Старт-строка для пользователя (PowerShell, полные пути; `""` можно не писать — парсер классифицирует
+хвост по форме, `.ini` отделяется от списка offset'ов по запятой):
+
+```powershell
+$exe = "$env:USERPROFILE\Downloads\arc_tool.exe"
+$dmp = "C:\Users\Malin\AppData\Local\Temp\PioneerGame (3).DMP"
+& $exe esp-chain "$dmp" 0x140000000 0x139F9000 0x108FEEC0 "$env:USERPROFILE\esp.ini" *> "$env:USERPROFILE\esp-chain.txt"
+Get-Content "$env:USERPROFILE\esp.ini"
+```
+
+Ничего не проверено в live game; все значения — вывод офлайн-предикатов на одном дампе, они обязаны
+повториться на втором дампе, прежде чем пойти в конфиг оверлея.

@@ -2510,6 +2510,435 @@ void PrintDumpFNameLayout(
     PrintNameLayout(std::cout, "dump layout", read, va, window_size, max_hits);
 }
 
+namespace {
+
+// Structural predicates for the object graph, used instead of class names. A name is only a label; every
+// test below is something a wrong offset cannot satisfy, which is what makes this route independent of
+// the FName pool (measured: this build's pool beyond block 0 is not in any of the three dumps).
+struct EspReader {
+    const std::span<const std::uint8_t> bytes;
+    const std::vector<MemoryRange>& ranges;
+    std::uint64_t image_base{};
+    std::uint64_t image_size{};
+
+    [[nodiscard]] std::optional<std::uint64_t> Qword(const std::uint64_t va) const {
+        const auto span = ReadCaptured(bytes, ranges, va, 8);
+        if (!span || span->size() < 8) {
+            return std::nullopt;
+        }
+        return U64(span->data());
+    }
+    [[nodiscard]] std::optional<std::uint32_t> Dword(const std::uint64_t va) const {
+        const auto span = ReadCaptured(bytes, ranges, va, 4);
+        if (!span || span->size() < 4) {
+            return std::nullopt;
+        }
+        return U32(span->data());
+    }
+    [[nodiscard]] bool InImage(const std::uint64_t va) const {
+        return va >= image_base && va - image_base < image_size;
+    }
+    // An object header is a pointer to a vtable inside the module: true for every UObject and for the
+    // components, and essentially never true by accident for a float field or a stale value.
+    [[nodiscard]] bool LooksLikeObject(const std::uint64_t va, std::uint64_t* vtable = nullptr) const {
+        if (va < 0x1000) {
+            return false;
+        }
+        const auto head = Qword(va);
+        if (!head || *head < 0x1000) {
+            return false;
+        }
+        if (!InImage(*head)) {
+            return false;
+        }
+        // The vtable slot itself must be readable and point back into the module's code.
+        const auto entry = Qword(*head);
+        if (!entry || !InImage(*entry)) {
+            return false;
+        }
+        if (vtable != nullptr) {
+            *vtable = *head;
+        }
+        return true;
+    }
+    // A world position: three finite floats, at least one non-trivial, magnitudes inside what a level
+    // blueprint uses. Zero triples (components at the origin) and NaN/inf garbage are both rejected.
+    [[nodiscard]] bool FloatTriple(const std::uint64_t va, float out[3]) const {
+        const auto span = ReadCaptured(bytes, ranges, va, 12);
+        if (!span || span->size() < 12) {
+            return false;
+        }
+        float values[3];
+        std::memcpy(values, span->data(), sizeof(values));
+        for (const auto value : values) {
+            const auto absolute = value < 0.0F ? -value : value;
+            if (absolute == 0.0F) {
+                return false;  // a zero axis makes the read ambiguous by one float
+            }
+            // The halves of a 64-bit pointer read as floats come out denormal or tiny, so this band is
+            // what stops the next object's vtable from being accepted as a coordinate - measured on the
+            // synthetic, where components sit 0x100 apart and the lowest offset was exactly that.
+            if (absolute < 1.0e-2F || absolute > 1.0e6F) {
+                return false;  // NaN, denormal, rotation-sized noise, or an impossible coordinate
+            }
+        }
+        std::memcpy(out, values, sizeof(values));
+        return true;
+    }
+};
+
+// TArray<T> in a UE container is { void* Data; int32 Num; int32 Max; }. The count and the capacity have
+// to agree with the data pointer, and for a pointer array every element has to be a real object.
+bool LooksLikeObjectArray(const EspReader& mem, const std::uint64_t data_va, const std::uint32_t num,
+    const std::uint32_t max, const std::uint32_t probe_limit, std::uint32_t* good) {
+    if (num == 0 || num > 200000U || max < num || data_va < 0x1000) {
+        return false;
+    }
+    const auto probes = std::min<std::uint32_t>(num, probe_limit);
+    std::uint32_t hits = 0;
+    for (std::uint32_t i = 0; i < probes; ++i) {
+        const auto element = mem.Qword(data_va + i * 8);
+        if (element && mem.LooksLikeObject(*element)) {
+            ++hits;
+        }
+    }
+    if (good != nullptr) {
+        *good = hits;
+    }
+    return hits == probes && probes > 0;
+}
+
+// AActor -> RootComponent -> USceneComponent::RelativeLocation, derived from the dump rather than
+// assumed: for every object-pointer slot of every actor, does that component hold a float triple that
+// looks like a position. The offset that most actors agree on is the field.
+struct FieldHits {
+    std::uint32_t offset{};
+    std::uint32_t count{};
+};
+
+}  // namespace
+
+void PrintDumpEspChain(
+    const std::filesystem::path& path,
+    const std::uint64_t image_base,
+    const std::uint64_t image_size,
+    const std::uint64_t global_rva,
+    const std::string_view chain_list,
+    const std::filesystem::path& ini_out) {
+    if (image_base == 0 || image_size == 0 || global_rva > image_size) {
+        throw std::invalid_argument(
+            "esp-chain needs the module base and size, and a global RVA inside the image");
+    }
+    // The chain arrives as a comma separated list of offsets, each applied after one pointer read. The
+    // default is the sequence found by the structural chain scan and re-confirmed on two gameplay dumps
+    // (global 0x108FEEC0 -> +0xA0 -> +0x250 -> +0x160); a build that moved the fields needs a new list,
+    // and the FAIL lines below say which step broke.
+    std::vector<std::uint64_t> chain;
+    {
+        std::string current;
+        for (const char character : chain_list) {
+            if (character == ',' || character == ' ' || character == ';') {
+                if (!current.empty()) {
+                    chain.push_back(std::stoull(current, nullptr, 0));
+                    current.clear();
+                }
+            } else {
+                current.push_back(character);
+            }
+        }
+        if (!current.empty()) {
+            chain.push_back(std::stoull(current, nullptr, 0));
+        }
+    }
+    if (chain.empty() && chain_list.empty()) {
+        chain = {0xA0, 0x250, 0x160};
+    }
+
+    const MappedFile file(path);
+    const auto bytes = file.Bytes();
+    const auto streams = ReadStreams(bytes);
+    const auto ranges = ReadMemoryRanges(bytes, streams);
+    const EspReader mem{bytes, ranges, image_base, image_size};
+
+    std::cout << "build=" << kBuildStamp << "\n";
+    std::cout << "image=0x" << std::hex << image_base << " size=0x" << image_size << " global=0x"
+              << image_base + global_rva << std::dec << "\n";
+    std::cout << "captured_ranges=" << ranges.size() << "\n";
+
+    std::vector<std::uint64_t> objects;
+    auto cursor = image_base + global_rva;
+    const auto first = mem.Qword(cursor);
+    if (!first) {
+        std::cout << "FAIL: the global at base+0x" << std::hex << global_rva
+                  << std::dec << " is not captured in this dump. Rerun with the base this dump actually"
+                                  " uses (PrintDumpInfo shows the module list) or pass a different RVA.\n";
+        return;
+    }
+    cursor = *first;
+    objects.push_back(cursor);
+    for (const auto offset : chain) {
+        const auto next = mem.Qword(cursor + offset);
+        if (!next || *next == 0) {
+            std::cout << "FAIL: chain step +0x" << std::hex << offset << std::dec
+                      << " from 0x" << cursor << " is null or uncaptured; the chain belongs to another"
+                                     " build. Re-run with the offsets of this build as the [chain]"
+                                     " argument (5th positional, comma separated).\n";
+            return;
+        }
+        cursor = *next;
+        objects.push_back(cursor);
+    }
+    std::cout << "\n[chain] start global=0x" << std::hex << image_base + global_rva << std::dec << "\n";
+    for (std::size_t i = 0; i < objects.size(); ++i) {
+        std::uint64_t vtable = 0;
+        const auto ok = mem.LooksLikeObject(objects[i], &vtable);
+        std::cout << "  obj[" << i << "]=0x" << std::hex << objects[i] << " vtable=0x" << vtable
+                  << std::dec << " object_header=" << (ok ? "yes" : "NO") << "\n";
+    }
+
+    // UWorld and ULevel recognise each other: the level stores a pointer back to its own world. Testing
+    // the round trip at one offset on both sides identifies the pair without knowing either class name.
+    static constexpr std::array<std::uint32_t, 14> kLevelOffsets{{
+        0x28, 0x30, 0x38, 0x40, 0x98, 0xA0, 0xE8, 0xF0, 0xF8, 0x100, 0x108, 0x110, 0x140, 0x160,
+    }};
+    struct LevelHit {
+        std::uint64_t world{};
+        std::uint64_t level{};
+        std::uint32_t world_off{};
+        std::uint32_t level_off{};
+    };
+    std::vector<LevelHit> level_hits;
+    std::cout << "\n[uworld/level] round trip [world+a]=level and [level+b]=world\n";
+    for (const auto world : objects) {
+        for (const auto a : kLevelOffsets) {
+            const auto level = mem.Qword(world + a);
+            if (!level || *level < 0x1000) {
+                continue;
+            }
+            for (const auto b : kLevelOffsets) {
+                const auto back = mem.Qword(*level + b);
+                if (!back || *back != world) {
+                    continue;
+                }
+                std::cout << "  HIT world=0x" << std::hex << world << " +0x" << a << std::dec << " -> level=0x"
+                          << std::hex << *level << " +0x" << b << std::dec << " -> world  (world_off=0x"
+                          << std::hex << a << " level_off=0x" << b << std::dec << ")\n";
+                level_hits.push_back({world, *level, a, b});
+            }
+        }
+    }
+    if (level_hits.empty()) {
+        std::cout << "  no round trip in 0x28..0x160 on any chain object: either the chain does not end at"
+                     " UWorld, or the level pointer is obfuscated in this build. Both are answers - the"
+                     " second means the ESP has to start from an object whose level link is plaintext.\n";
+    }
+
+    // The actor array of the level, derived by the same kind of test: TArray of object pointers.
+    std::cout << "\n[level] actor array search (TArray of UObject*)\n";
+    std::uint64_t actors_va = 0;
+    std::uint32_t actor_count = 0;
+    std::uint32_t actors_off = 0;
+    for (const auto& hit : level_hits) {
+        for (std::uint32_t off = 0x20; off + 16 <= 0x400; off += 8) {
+            const auto data = mem.Qword(hit.level + off);
+            if (!data) {
+                continue;
+            }
+            const auto num = mem.Dword(hit.level + off + 8);
+            const auto max = mem.Dword(hit.level + off + 0xC);
+            if (!num || !max) {
+                continue;
+            }
+            std::uint32_t good = 0;
+            if (!LooksLikeObjectArray(mem, *data, *num, *max, 6, &good)) {
+                continue;
+            }
+            std::cout << "  HIT level=0x" << std::hex << hit.level << " +0x" << off << " data=0x"
+                      << *data << std::dec << " num=" << *num << " max=" << *max
+                      << " (all 6 sampled elements are objects with in-image vtables)\n";
+            if (actor_count == 0 || *num > actor_count) {
+                actor_count = *num;
+                actors_va = *data;
+                actors_off = off;
+            }
+        }
+    }
+    if (actors_va == 0) {
+        std::cout << "  no TArray of objects in the first 0x400 bytes of any level candidate.\n";
+    }
+
+    // Positions, derived over the whole actor array and voted on, so the reported offset is the one the
+    // actors agree on instead of one copied from another build.
+    std::vector<FieldHits> root_hits;
+    std::vector<FieldHits> loc_hits;
+    std::uint32_t sampled = 0;
+    if (actors_va != 0) {
+        constexpr std::uint32_t kActorProbe = 48;
+        const auto probes = std::min<std::uint32_t>(actor_count, kActorProbe);
+        std::cout << "\n[actors] sampling " << probes << " of " << actor_count << "\n";
+        for (std::uint32_t i = 0; i < probes; ++i) {
+            const auto actor = mem.Qword(actors_va + i * 8);
+            if (!actor || !mem.LooksLikeObject(*actor)) {
+                continue;
+            }
+            ++sampled;
+            // Record every candidate instead of the first one: the field is the offset the majority of
+            // actors agree on, and a first-match scan would report whichever low offset holds bytes that
+            // happen to look like floats.
+            std::set<std::pair<std::uint32_t, std::uint32_t>> pairs;
+            for (std::uint32_t off = 0x100; off + 8 <= 0x400 && pairs.size() < 64; off += 8) {
+                const auto component = mem.Qword(*actor + off);
+                if (!component || !mem.LooksLikeObject(*component)) {
+                    continue;
+                }
+                for (std::uint32_t lo = 0x100; lo + 12 <= 0x240 && pairs.size() < 64; lo += 4) {
+                    float triple[3];
+                    if (!mem.FloatTriple(*component + lo, triple)) {
+                        continue;
+                    }
+                    if (!pairs.insert({off, lo}).second) {
+                        continue;
+                    }
+                    for (auto* table : {&root_hits, &loc_hits}) {
+                        const auto want = table == &root_hits ? off : lo;
+                        const auto hit = std::find_if(table->begin(), table->end(),
+                            [want](const FieldHits& item) { return item.offset == want; });
+                        if (hit == table->end()) {
+                            table->push_back({want, 1});
+                        } else {
+                            ++hit->count;
+                        }
+                    }
+                }
+            }
+        }
+        const auto rank = [](std::vector<FieldHits> hits) {
+            std::sort(hits.begin(), hits.end(),
+                [](const FieldHits& l, const FieldHits& r) { return l.count > r.count; });
+            return hits;
+        };
+        root_hits = rank(std::move(root_hits));
+        loc_hits = rank(std::move(loc_hits));
+        std::cout << "  component-offset votes:";
+        for (std::size_t i = 0; i < root_hits.size() && i < 6; ++i) {
+            std::cout << " +0x" << std::hex << root_hits[i].offset << std::dec << "="
+                      << root_hits[i].count << "/" << sampled;
+        }
+        std::cout << "\n  location-offset votes:";
+        for (std::size_t i = 0; i < loc_hits.size() && i < 6; ++i) {
+            std::cout << " +0x" << std::hex << loc_hits[i].offset << std::dec << "="
+                      << loc_hits[i].count << "/" << sampled;
+        }
+        std::cout << "\n";
+        for (std::size_t i = 0; i < root_hits.size() && i < 3; ++i) {
+            std::cout << "    candidate component +0x" << std::hex << root_hits[i].offset << std::dec
+                      << "=" << root_hits[i].count << "\n";
+        }
+        for (std::size_t i = 0; i < loc_hits.size() && i < 3; ++i) {
+            std::cout << "    candidate location +0x" << std::hex << loc_hits[i].offset << std::dec << "="
+                      << loc_hits[i].count << "\n";
+        }
+        if (!root_hits.empty() && !loc_hits.empty()) {
+            const auto root_off = root_hits.front().offset;
+            const auto loc_off = loc_hits.front().offset;
+            std::cout << "  winner: [actor+0x" << std::hex << root_off
+                      << "] -> component, [component+0x" << loc_off << std::dec
+                      << "] -> FVector\n";
+            std::uint32_t with_position = 0;
+            std::array<std::array<float, 2>, 3> bounds{{
+                {{1.0e30F, -1.0e30F}}, {{1.0e30F, -1.0e30F}}, {{1.0e30F, -1.0e30F}}}};
+            for (std::uint32_t i = 0; i < probes; ++i) {
+                const auto actor = mem.Qword(actors_va + i * 8);
+                if (!actor || !mem.LooksLikeObject(*actor)) {
+                    continue;
+                }
+                const auto component = mem.Qword(*actor + root_off);
+                float triple[3];
+                if (!component || !mem.FloatTriple(*component + loc_off, triple)) {
+                    continue;
+                }
+                ++with_position;
+                for (std::size_t axis = 0; axis < 3; ++axis) {
+                    bounds[axis][0] = std::min(bounds[axis][0], triple[axis]);
+                    bounds[axis][1] = std::max(bounds[axis][1], triple[axis]);
+                }
+                if (i < 8) {
+                    std::cout << "    actor[" << i << "]=0x" << std::hex << *actor << std::dec << " pos=("
+                              << triple[0] << ", " << triple[1] << ", " << triple[2] << ")\n";
+                }
+            }
+            std::cout << "  positions at the winning offsets: " << with_position << "/" << sampled << "\n";
+            if (with_position != 0) {
+                std::cout << "  spread X=[" << bounds[0][0] << ".." << bounds[0][1] << "] Y=[" << bounds[1][0]
+                          << ".." << bounds[1][1] << "] Z=[" << bounds[2][0] << ".." << bounds[2][1]
+                          << "] (a real level spreads over thousands of units on X/Y)\n";
+            }
+            if (with_position * 2 < sampled) {
+                std::cout << "  note: fewer than half the actors agree on this pair, so it is a candidate"
+                             " and not a measurement - print a wider sample before trusting it.\n";
+            }
+        }
+    }
+
+    // One line that spells the whole read out, so it can be pasted into a config without recomputation.
+    std::cout << "\n[read path]\n  ";
+    std::cout << "[base+0x" << std::hex << global_rva << "]";
+    for (const auto offset : chain) {
+        std::cout << " -> [+0x" << offset << "]";
+    }
+    if (!level_hits.empty()) {
+        std::cout << " = world -> [world+0x" << level_hits[0].world_off << std::dec << "]";
+        if (actors_va != 0) {
+            std::cout << " = level -> [level+0x" << std::hex << actors_off << std::dec << "]";
+        }
+    }
+    if (!root_hits.empty()) {
+        std::cout << " = actor -> [actor+0x" << std::hex << root_hits[0].offset << std::dec << "]";
+    }
+    if (!loc_hits.empty()) {
+        std::cout << " = component -> [component+0x" << std::hex << loc_hits[0].offset << std::dec
+                  << "] = FVector";
+    }
+    std::cout << "\n  (a step in this line that was not found is simply absent; the section above it says"
+                 " why)\n";
+
+    std::cout << "\nSUMMARY sampled_objects=" << objects.size() << " level_hits=" << level_hits.size()
+              << " actors=" << actor_count << " position_actors=" << sampled << "\n";
+    if (!ini_out.empty()) {
+        std::ofstream out(ini_out.string());
+        if (!out) {
+            std::cout << "  could not write " << ini_out << "\n";
+        } else {
+            out << "# derived offline from this dump by structural predicates; not validated in a live"
+                   " process\n";
+            out << "[esp]\n";
+            out << "image_base = 0x" << std::hex << image_base << std::dec << "\n";
+            out << "global_rva = 0x" << std::hex << global_rva << std::dec << "\n";
+            out << "chain =";
+            for (std::size_t i = 0; i < chain.size(); ++i) {
+                out << (i == 0 ? " " : ",") << "0x" << std::hex << chain[i] << std::dec;
+            }
+            out << "\n";
+            if (!level_hits.empty()) {
+                out << "world = 0x" << std::hex << level_hits[0].world << "\n";
+                out << "persistent_level_off = 0x" << level_hits[0].world_off << "\n";
+                out << "level = 0x" << std::hex << level_hits[0].level << "\n";
+                out << "level_owning_world_off = 0x" << level_hits[0].level_off << "\n";
+            }
+            if (actors_va != 0) {
+                out << "level_actors_off = 0x" << std::hex << actors_off << std::dec << "\n";
+            }
+            if (!root_hits.empty()) {
+                out << "root_component_off = 0x" << std::hex << root_hits[0].offset << std::dec << "\n";
+            }
+            if (!loc_hits.empty()) {
+                out << "relative_location_off = 0x" << std::hex << loc_hits[0].offset << std::dec << "\n";
+            }
+            std::cout << "  ini written to " << ini_out << "\n";
+        }
+    }
+}
+
 } // namespace arc
 
 #endif
