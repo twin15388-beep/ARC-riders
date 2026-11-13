@@ -217,7 +217,7 @@ PYTHONPATH=/tmp/arc-check/zig-package python3 -m ziglang c++ -target x86_64-wind
 ```
 
 Exit 0. Size `1,190,912`, SHA-256 `3a7892ba226b7cb5d79e6eeba5e255fc0971425335519d39ab7a99421b23174e`,
-MZ/PE/AMD64/PE32+ validated. Uploaded to Dropbox `/arc_tool.exe`, rev `660263c4bcaa54b309220`. `Process.cpp` and `DumpFile.cpp` compile only under `_WIN32`, so zig is the
+MZ/PE/AMD64/PE32+ validated. Uploaded to Dropbox `/arc_tool.exe`, rev `660268df9e4014b309220`. `Process.cpp` and `DumpFile.cpp` compile only under `_WIN32`, so zig is the
 only compiler that has seen them in this session; MSVC has not.
 
 End-to-end check of the new dump command without the game: the real `PrintDumpFNameBlocks` was compiled

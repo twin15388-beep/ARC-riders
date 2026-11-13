@@ -225,7 +225,7 @@ base=0x1c9e14cc3d0`), а `PioneerGame.exe size=0x1d82000` из LDR-записи 
 .\arc_tool.exe probe <pid>
 ```
 
-EXE в Dropbox: `/arc_tool.exe`, rev `660263c4bcaa54b309220` (заменён на сборку
+EXE в Dropbox: `/arc_tool.exe`, rev `660268df9e4014b309220` (заменён на сборку
 `2026-11-13-layout-probe`, размер `1,245,184`, SHA-256
 `17ed9f27a15d91762c6fdd82626e382cbcdca77af81d2e64f8b610f492fa17c1`). В репозитории тот же файл —
 `out/arc_tool.exe`, сам `out/` в git не попадает.
