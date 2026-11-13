@@ -262,6 +262,41 @@ PREDICATE PASS blocks=21 names=2390 pool_referrers_image=0 heap=1
 Если после этого охота даст `deepest chain = 0` и ни одного валидированного блока — значит остального пула
 в дампе нет физически, и единственный честный шаг: переснять дамп (`procdump -ma`), а не менять кодек.
 
+### 6.2 Девятый прогон: три дампа дают один и тот же блок 0, и это measurement, а не догадка
+
+`(2).DMP` и `PioneerGame.DMP` прогнаны без якоря (блок 0 найден маркером `None`):
+
+```text
+captured_ranges=40599  scanned_bytes=10670362624  marker_hits=7106 (None only)
+anchor block_data=0xa7b10000 codec=packed_shift6_no_terminator entries=534 consumed=0x25c8
+  Actor ordinal=57  Pawn ordinal=63  PersistentLevel ordinal=81
+  hunt "PersistentLevel": 1 hit, deepest chain in front of a hit = 40
+  verdict: no occurrence of a dynamically registered name ... (the rest of the pool is not captured)
+  sweep: 11 candidate stream(s) below 512 entries dropped
+  page sweep: 1 chain-validated block(s), total_names>=534
+```
+
+`pool_names_0.txt` и `pool_names_2.txt` — 534 строки, **побайтово identical** между двумя разными
+сессиями. То есть блок 0 = статическая `EName`-таблица, её порядок и номера стабильны между запусками, и
+наши ординары `Actor=57`, `Pawn=63`, `PersistentLevel=81`, `Team=103` — надёжны для этого билда. Всё, чего
+в них нет, — динамические имена (World, SceneComponent, классы игры), они в блоках 1..N.
+
+Отдельно зафиксировано: обратный проход по цепочке от `PersistentLevel` внутри блока 0 даёт только 40
+записей вместо 81 — правило «предок заканчивается ровно перед заголовком» ломается на части записей
+статической таблицы. Причина пока не измерена, но для охоты это значит, что порог глубины надо брать
+ниже порога sweep'а: принято `max(8, min_entries/4)`, а мусор отсекает absorb-правило (хит внутри уже
+принятого блока поглощается им, как в синтетике).
+
+Сборка `2026-11-13-hunt2` добавляет то, чего не хватало для вывода о покрытии дампа: счётчик СЫРЫХ
+вхождений каждого имени (`raw=`, отдельно «в модуле» и «снаружи»), 4 образца байтов перед хитами вне
+модуля (вот где видно настоящий заголовок, если формат другой), `page map around the anchor` — статус
+каждого 0x10000-соседа блока 0 (`uncaptured` / `zero-filled` / `non-zero` / `NAME STREAM`), и три разных
+вердикта вместо одного: «имени нет нигде вне модуля → пула в дампе нет, снимай `procdump -ma`»; «имя есть,
+но ни разу с packed-заголовком → формат другой, смотри raw[]»; «заголовки есть, цепочки короче порога →
+блок не непрерывен в дампе». Синтетики: `syn_hunt` (нестраницный блок) 601/600 и 1299 имён в файле;
+`syn_pack` регрессия 313; `syn_junk` (имён нет) → первый вердикт. ASan/UBSan чисто, `All core checks
+passed`, `-Werror` зелёные. В игре ничего не запускалось.
+
 Текущие сборки: `/arc_tool.exe` `1 254 912`, sha256
 `2e16ad4889561295da240dc362fc125c469e7a36be03af812c9af4e3f3d5080f`, stamp `2026-11-13-write-probe`,
 rev `660275fc2ae9d4b309220`. `arc_inject.exe` `958 464`, sha256
@@ -408,9 +443,9 @@ https://www.dropbox.com/scl/fi/37w7un59wy4kc3slpw5xs/arc_tool.exe?rlkey=oes20rpm
 `dump-fname-layout` + `probe`/`probe-write`):
 
 ```text
-Size:    1336320 bytes
-SHA-256: 7281ea710a86d60ac2ab8916ea901bf36a0233084babfe31a6db53df529911dc
-build stamp: 2026-11-13-hunt  (Dropbox rev 6602a0754bcb24b309220)
+Size:    1342976 bytes
+SHA-256: e77e85b598e0e240ce2a92aa2427d1450059490c4dbc87bfdd046d6aa87713e0
+build stamp: 2026-11-13-hunt2  (Dropbox rev 6602a8b610c124b309220)
 arc_inject.exe (впрыск закрыт измерением, оставлен для полноты): 958464 bytes
 SHA-256: 2ec75e420b7314eebae10394997ebbb054fbb556b9c6bbb5ce0a59924fcfba7e
 ```

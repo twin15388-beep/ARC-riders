@@ -1143,8 +1143,9 @@ constexpr std::array<std::string_view, 9> kWantedNames{{
 // Hunt needles. Chosen because they are registered dynamically (not part of the engine's static EName
 // table, so they cannot be reached from block 0) and because every shipped UE build registers them: if
 // the pool's later blocks are present in a dump at all, one of these names lives in one of them.
-constexpr std::array<std::string_view, 3> kHuntNames{{
-    "PersistentLevel", "PlayerController", "RootComponent",
+constexpr std::array<std::string_view, 6> kHuntNames{{
+    "PersistentLevel", "PlayerController", "RootComponent", "SceneComponent", "SkeletalMeshComponent",
+    "CharacterMovementComponent",
 }};
 
 struct BackwardChain {
@@ -1204,8 +1205,12 @@ struct BackwardChain {
                 }
                 continue;
             }
-            // The entry spans [q, q + 2 + len); the next header starts at that end or one byte later.
-            if (q + 2 + len != at && q + 3 + len != at) {
+            // The entry spans [q + 2, q + 2 + len); the next header starts at that end or one byte
+            // later. kNameCodecPacked has no wide form for this build (its wide bit position is outside
+            // the 16-bit header), and accepting a 2*len variant instead lets the walk chain through random
+            // bytes - measured: a junk region produced 600 "entries". Strictness is the point here.
+            const auto entry_end = q + 2 + len;
+            if (entry_end != at && entry_end + 1 != at) {
                 continue;
             }
             const auto name_va = q + 2;
@@ -1885,6 +1890,52 @@ void PrintDumpFNameBlocks(
         std::cout << "  stride_blocks=" << stride_blocks << " stride_entries=" << stride_entries
                   << " (further blocks at block_size intervals that still decode as name streams)\n";
 
+        // "stride_blocks=0" has three very different causes, and only one of them is about the allocator:
+        // the dump never captured the page, the page is zero-filled (a region the writer skipped or that
+        // was never written), or the pool continues with something the codec does not model. Printing the
+        // cause per page turns the negative result into a statement about the dump.
+        std::cout << "  page map around the anchor (each 0x10000 slot: uncaptured / zero-filled /"
+                     " non-zero):\n";
+        for (int k = -4; k <= 24; ++k) {
+            if (k == 0) {
+                continue;
+            }
+            const auto page_va = static_cast<std::uint64_t>(
+                static_cast<std::int64_t>(anchor.data_va) + static_cast<std::int64_t>(k) * 0x10000);
+            const auto head = read(page_va, 0x1000);
+            std::cout << "    " << (k < 0 ? "-" : "+") << (k < 0 ? -k : k) << "] 0x" << std::hex
+                      << page_va << std::dec << (in_image(page_va) ? " [image]" : " [heap]") << " ";
+            if (!head || head->size() < 0x1000) {
+                std::cout << "uncaptured\n";
+                continue;
+            }
+            std::uint64_t nonzero = 0;
+            for (const auto byte : *head) {
+                nonzero += byte != 0 ? 1 : 0;
+            }
+            if (nonzero == 0) {
+                std::cout << "zero-filled (first 4 KiB)\n";
+                continue;
+            }
+            std::cout << "non-zero " << nonzero << "/0x1000";
+            const auto block = read(page_va, block_size);
+            if (block) {
+                const auto walk = DetectNameBlock(*block, kNameCodecCandidates, "", min_entries, entry_cap);
+                if (walk.codec != nullptr) {
+                    std::cout << " NAME STREAM entries=" << walk.entries.size() << " first=\""
+                              << (walk.entries.empty() ? "" : walk.entries.front().text) << "\"";
+                } else {
+                    std::cout << " no name stream; bytes=";
+                    for (std::size_t b = 0; b < 24 && b < block->size(); ++b) {
+                        std::cout << std::hex << std::setw(2) << std::setfill('0')
+                                  << static_cast<int>((*block)[b]);
+                    }
+                    std::cout << std::setfill(' ') << std::dec;
+                }
+            }
+            std::cout << '\n';
+        }
+
         // Every captured pointer to the block: an in-image hit is a GNames candidate with a stable RVA,
         // a heap hit is only useful inside this dump.
         std::size_t image_refs = 0;
@@ -2047,23 +2098,36 @@ void PrintDumpFNameBlocks(
                     hits.push_back(std::move(h));
                 }
             }
-            // Expand each page hit over the whole block window, then drop any hit that sits inside an
-            // earlier hit's chain: pages in the middle of a block chain too, and adjacent blocks are
-            // legitimately absorbed into one continuous stream (the order is unchanged by that).
             // Alignment-agnostic name hunt. The page pass above only tests 0x1000-aligned stream
             // starts - which is how block 0 was found - so a pool block whose first entry is not page
-            // aligned (a general-allocator block, for instance) is invisible to it. Hunt for the bytes of
-            // kHuntNames at every alignment instead, and let the backward chain decide whether a hit is
-            // pool content or a stray string literal in module data.
-            std::uint64_t hunt_candidates = 0;
+            // aligned (a block from the general allocator, for instance) is invisible to it. Hunting the
+            // bytes of names that must be in the pool answers two different questions at once, and the
+            // previous run could only answer one of them:
+            //   raw hits            - is the string in the captured memory at all? (coverage question:
+            //                         "the dump is missing the pool" and "the codec is wrong" look the
+            //                         same when only header-validated hits are counted)
+            //   header_ok + depth   - is it a packed pool entry, and how deep does the chain go back?
+            // Raw hits inside the module are string literals and mean nothing; raw hits *outside* it with
+            // no packed header in front are the interesting case, so a few of those get their bytes
+            // printed - that hex is what would show a different entry header.
+            struct HuntStat {
+                std::string_view needle;
+                std::uint64_t raw = 0;
+                std::uint64_t raw_in_image = 0;
+                std::uint64_t header_ok = 0;
+                std::uint32_t best_depth = 0;
+                std::uint64_t best_va = 0;
+                std::vector<std::uint64_t> outside_samples;
+            };
+            std::vector<HuntStat> stats;
+            for (const auto& needle : kHuntNames) {
+                stats.push_back(HuntStat{needle, 0, 0, 0, 0, 0, {}});
+            }
             std::uint64_t hunt_printed = 0;
-            std::uint32_t hunt_best_depth = 0;
-            std::string hunt_best_name;
-            std::uint64_t hunt_best_va = 0;
             std::set<std::uint64_t> hunt_starts;
             bool hunt_capped = false;
-            for (const auto& needle : kHuntNames) {
-                std::uint64_t per_needle = 0;
+            for (auto& stat : stats) {
+                const auto& needle = stat.needle;
                 for (const auto& range : ranges) {
                     const std::string_view span(
                         reinterpret_cast<const char*>(bytes.data() + range.file_offset),
@@ -2078,12 +2142,18 @@ void PrintDumpFNameBlocks(
                         }
                         from = pos + 1;
                         const auto name_va = range.va + pos;
+                        ++stat.raw;
+                        if (in_image(name_va)) {
+                            ++stat.raw_in_image;
+                        } else if (stat.outside_samples.size() < 4) {
+                            stat.outside_samples.push_back(name_va);
+                        }
                         if (name_va < 4) {
                             continue;
                         }
                         // The entry header must sit immediately in front and declare exactly this length.
-                        // Read it straight out of the mapped range: a big dump holds plenty of these
-                        // names inside longer strings, and the header test is what throws them away.
+                        // Read it straight out of the mapped range: a big dump holds plenty of these names
+                        // inside longer strings, and the header test is what throws them away.
                         const std::uint16_t header_before = [&]() {
                             if (pos >= 2) {
                                 return U16(reinterpret_cast<const std::uint8_t*>(span.data()) + pos - 2);
@@ -2094,8 +2164,7 @@ void PrintDumpFNameBlocks(
                         if ((header_before >> 6) != needle.size()) {
                             continue;
                         }
-                        ++hunt_candidates;
-                        ++per_needle;
+                        ++stat.header_ok;
                         // The window is clamped into the range the hit sits in: a block near the start of
                         // a captured region has nothing in front of it *in the dump*, and shrinking is
                         // what tells a short chain apart from an uncaptured one.
@@ -2120,6 +2189,10 @@ void PrintDumpFNameBlocks(
                         }
                         const auto back =
                             WalkBackward({win->data(), win->size()}, win_va, name_va - 2, 0x4000);
+                        if (back.entries > stat.best_depth) {
+                            stat.best_depth = back.entries;
+                            stat.best_va = name_va;
+                        }
                         if (hunt_printed < 24) {
                             ++hunt_printed;
                             std::cout << "    hunt \"" << needle << "\" at 0x" << std::hex << name_va
@@ -2128,16 +2201,11 @@ void PrintDumpFNameBlocks(
                                       << " first_entry=0x" << back.first_entry_va << std::dec
                                       << (back.first_entry_va % 0x1000 == 0 ? " page-aligned"
                                                                             : " NOT page-aligned")
-                                      << std::dec
                                       << (back.hit_window ? " (window edge, start is a lower bound)" : "")
                                       << '\n';
                         }
-                        if (back.entries > hunt_best_depth) {
-                            hunt_best_depth = back.entries;
-                            hunt_best_name = std::string(needle);
-                            hunt_best_va = name_va;
-                        }
-                        if (back.entries < min_entries) {
+                        const auto hunt_min_depth = std::max<std::uint32_t>(8U, min_entries / 4U);
+                        if (back.entries < hunt_min_depth) {
                             continue;
                         }
                         // Padding is not proof of a boundary: a block preceded by another block's zero
@@ -2161,24 +2229,68 @@ void PrintDumpFNameBlocks(
                         hits.push_back(std::move(h));
                     }
                 }
-                std::cout << "  hunt \"" << needle << "\": " << per_needle
-                          << " hit(s) with a valid packed header in front\n";
             }
-            std::cout << "  hunt: " << hunt_candidates << " packed-header candidate(s) examined, deepest"
-                         " chain in front of a hit = "
-                      << hunt_best_depth;
-            if (hunt_best_depth != 0) {
-                std::cout << " (\"" << hunt_best_name << "\" at 0x" << std::hex << hunt_best_va
-                          << std::dec << ")";
+            std::uint64_t hunt_total = 0;
+            std::uint64_t hunt_raw_outside = 0;
+            std::uint32_t hunt_best_depth = 0;
+            for (const auto& stat : stats) {
+                hunt_total += stat.header_ok;
+                hunt_raw_outside += stat.raw - stat.raw_in_image;
+                if (stat.best_depth > hunt_best_depth) {
+                    hunt_best_depth = stat.best_depth;
+                }
+                std::cout << "  hunt \"" << stat.needle << "\": raw=" << stat.raw << " (in module "
+                          << stat.raw_in_image << ", outside " << stat.raw - stat.raw_in_image
+                          << ") packed_header=" << stat.header_ok << " deepest_chain=" << stat.best_depth;
+                if (stat.best_depth != 0) {
+                    std::cout << " (0x" << std::hex << stat.best_va << std::dec << ")";
+                }
+                std::cout << '\n';
+                for (std::size_t i = 0; i < stat.outside_samples.size(); ++i) {
+                    const auto sample = stat.outside_samples[i];
+                    const auto around = read(sample - 16, 16 + stat.needle.size() + 16);
+                    if (!around) {
+                        continue;
+                    }
+                    std::cout << "    raw[" << i << "] 0x" << std::hex << sample - 16 << std::dec
+                              << " before=";
+                    for (std::size_t b = 0; b < 16; ++b) {
+                        std::cout << std::hex << std::setw(2) << std::setfill('0')
+                                  << static_cast<int>((*around)[b]);
+                    }
+                    std::cout << std::setfill(' ') << std::dec << " after=";
+                    for (std::size_t b = 16 + stat.needle.size(); b < around->size(); ++b) {
+                        std::cout << std::hex << std::setw(2) << std::setfill('0')
+                                  << static_cast<int>((*around)[b]);
+                    }
+                    std::cout << std::setfill(' ') << std::dec << '\n';
+                }
             }
-            std::cout << '\n';
+            std::cout << "  hunt: " << hunt_total << " packed-header candidate(s) examined, "
+                      << hunt_raw_outside << " raw occurrence(s) outside the module, deepest chain in"
+                         " front of a hit = "
+                      << hunt_best_depth << '\n';
             if (hunt_starts.empty()) {
-                std::cout << "  verdict: no occurrence of a dynamically registered name in this dump is"
-                             " preceded by " << min_entries
-                          << "+ chained entries, so the rest of the pool is not in the captured memory (or"
-                             " the packed header is wrong for names of these lengths). Capture a full"
-                             " memory dump (procdump -ma) before changing the codec again.\n";
+                if (hunt_raw_outside == 0) {
+                    std::cout << "  verdict: none of these name strings occurs anywhere in the captured"
+                                 " memory outside the module, so the dump does not hold the rest of the"
+                                 " pool. No codec change can recover what is not there: capture a full"
+                                 " memory dump (procdump -ma <pid> out.dmp) and rerun this command.\n";
+                } else if (hunt_total == 0) {
+                    std::cout << "  verdict: the names ARE in the captured memory outside the module but"
+                                 " never with a length-prefixed header in front, so blocks beyond the"
+                                 " anchor use a different entry format. The raw[] lines above show the"
+                                 " bytes in front of real occurrences - that is the header to model.\n";
+                } else {
+                    std::cout << "  verdict: packed headers were found outside the module but no chain of "
+                              << min_entries << "+ entries stands behind them, so the stream is either"
+                                 " interrupted by an entry form this codec does not model (the raw[] lines"
+                                 " show what is in front) or the block is not contiguous in the dump.\n";
+                }
             }
+            // Expand each page hit over the whole block window, then drop any hit that sits inside an
+            // earlier hit's chain: pages in the middle of a block chain too, and adjacent blocks are
+            // legitimately absorbed into one continuous stream (the order is unchanged by that).
             std::sort(hits.begin(), hits.end(),
                 [](const PageBlock& left, const PageBlock& right) { return left.va < right.va; });
             std::vector<std::pair<std::uint64_t, std::uint64_t>> covered;
