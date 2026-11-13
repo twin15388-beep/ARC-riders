@@ -88,6 +88,31 @@ void EnableDebugPrivilege() {
     ::CloseHandle(token);
 }
 
+// VirtualAllocEx was measured as denied on this build even with SeDebugPrivilege enabled, which is
+// what a memory-protection callback filtering remote allocation looks like. The native syscall is the
+// same operation through a different entry point, so it is tried first: if only the Win32 wrapper is
+// hooked, injection is still possible, and the report then says which path worked.
+void* AllocateRemote(const HANDLE process, const std::size_t size, std::string& how) {
+    using NtAllocateVirtualMemoryFn = NTSTATUS(NTAPI*)(HANDLE, PVOID*, ULONG_PTR, PSIZE_T, ULONG, ULONG);
+    const auto allocate = reinterpret_cast<NtAllocateVirtualMemoryFn>(
+        ::GetProcAddress(::GetModuleHandleW(L"ntdll.dll"), "NtAllocateVirtualMemory"));
+    if (allocate != nullptr) {
+        PVOID address = nullptr;
+        SIZE_T region = size;
+        const NTSTATUS status = allocate(process, &address, 0, &region, MEM_RESERVE | MEM_COMMIT,
+                                         PAGE_READWRITE);
+        if (status == 0 && address != nullptr) {
+            how = "ntdll!NtAllocateVirtualMemory";
+            return address;
+        }
+        std::cout << "nt_allocate_virtual_memory=status=0x" << std::hex << static_cast<std::uint32_t>(status)
+                  << std::dec << " (falling back to VirtualAllocEx)\n";
+    }
+    void* address = ::VirtualAllocEx(process, nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    how = "kernel32!VirtualAllocEx";
+    return address;
+}
+
 void Inject(const std::uint32_t pid, const std::filesystem::path& dll_path) {
     EnableDebugPrivilege();
     const auto full_path = std::filesystem::canonical(dll_path);
@@ -114,16 +139,17 @@ void Inject(const std::uint32_t pid, const std::filesystem::path& dll_path) {
         throw std::runtime_error("32-bit targets are not supported");
     }
 
-    RemoteMemory remote_memory(process.Get(), ::VirtualAllocEx(
-        process.Get(), nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    std::string allocator;
+    RemoteMemory remote_memory(process.Get(), AllocateRemote(process.Get(), bytes, allocator));
     if (remote_memory.Get() == nullptr) {
         const DWORD error = ::GetLastError();
         std::string hint;
         if (error == ERROR_ACCESS_DENIED) {
-            hint = " - the target denies remote allocation: run from an elevated PowerShell (the line "
-                   "above must say se_debug_privilege=enabled). If it is enabled and this still fails, "
-                   "the protection rejects remote memory, so use the reader + overlay path instead of "
-                   "injection and analyse the dump offline.";
+            hint = " - both the native syscall and VirtualAllocEx were refused, so the target denies "
+                   "remote allocation outright (se_debug_privilege line above says whether the shell was "
+                   "elevated). This is the end of the injection path for this protection: no Dumper-7, no "
+                   "in-process tool. Use arc_tool probe-write <pid> to confirm, then build the external "
+                   "reader + overlay and analyse dumps offline.";
         }
         ThrowWin32("VirtualAllocEx failed" + hint, error);
     }
@@ -163,7 +189,8 @@ void Inject(const std::uint32_t pid, const std::filesystem::path& dll_path) {
     if (module_handle == 0) {
         throw std::runtime_error("LoadLibraryW returned null in the target process");
     }
-    std::cout << "LoadLibraryW succeeded; remote module handle=0x" << std::hex << module_handle << '\n';
+    std::cout << "LoadLibraryW succeeded via " << allocator
+              << "; remote module handle=0x" << std::hex << module_handle << std::dec << '\n';
 }
 
 } // namespace

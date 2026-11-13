@@ -115,7 +115,15 @@ the module list is reachable through Toolhelp (77 modules).
 
 ```powershell
 .\arc_tool.exe probe <pid>
+.\arc_tool.exe probe-write <pid>
 ```
+
+`probe-write` measures remote allocation through `ntdll!NtAllocateVirtualMemory` and a
+`VirtualProtectEx` call with the page's own protection (a semantic no-op for the target). On the observed
+build, `OpenProcess` granted all eight rights and `ReadProcessMemory` succeeded 5 of 5 while
+`VirtualAllocEx` returned error 5 with `SeDebugPrivilege` enabled, which is why injection is treated as
+closed and `probe-write` does not write to game-owned memory: it only writes to a page it reserved
+itself.
 
 `arc_tool version` prints the embedded build stamp, and every FName report repeats it, because running
 a stale executable otherwise looks like a negative result about the game.

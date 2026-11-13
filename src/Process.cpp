@@ -165,6 +165,37 @@ namespace {
 
 using NtQueryInformationProcessFn = NTSTATUS(NTAPI*)(
     HANDLE, PROCESSINFOCLASS, PVOID, ULONG, PULONG);
+using NtAllocateVirtualMemoryFn = NTSTATUS(NTAPI*)(
+    HANDLE, PVOID*, ULONG_PTR, PSIZE_T, ULONG, ULONG);
+using NtFreeVirtualMemoryFn = NTSTATUS(NTAPI*)(HANDLE, PVOID*, PSIZE_T, ULONG);
+
+// Same privilege the injector now enables: an elevated shell keeps SeDebugPrivilege present but
+// disabled, and that difference is what made the old VirtualAllocEx failure uninterpretable.
+void EnableDebugPrivilegeForProbe() {
+    HANDLE token = nullptr;
+    if (!::OpenProcessToken(::GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
+        std::cout << "  se_debug_privilege=open_token_failed win32_error=" << ::GetLastError() << '\n';
+        return;
+    }
+    LUID luid{};
+    if (!::LookupPrivilegeValueW(nullptr, SE_DEBUG_NAME, &luid)) {
+        std::cout << "  se_debug_privilege=lookup_failed win32_error=" << ::GetLastError() << '\n';
+        ::CloseHandle(token);
+        return;
+    }
+    TOKEN_PRIVILEGES privileges{};
+    privileges.PrivilegeCount = 1;
+    privileges.Privileges[0].Luid = luid;
+    privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    if (!::AdjustTokenPrivileges(token, FALSE, &privileges, sizeof(privileges), nullptr, nullptr)) {
+        std::cout << "  se_debug_privilege=adjust_failed win32_error=" << ::GetLastError() << '\n';
+    } else if (::GetLastError() == ERROR_NOT_ALL_ASSIGNED) {
+        std::cout << "  se_debug_privilege=not_assigned (the shell is not elevated)\n";
+    } else {
+        std::cout << "  se_debug_privilege=enabled\n";
+    }
+    ::CloseHandle(token);
+}
 
 std::uint16_t LoadLe16(const std::uint8_t* const bytes) {
     return static_cast<std::uint16_t>(bytes[0]) | (static_cast<std::uint16_t>(bytes[1]) << 8);
@@ -562,6 +593,115 @@ void PrintProcessFNameLayout(const std::uint32_t pid, const std::uint64_t va, co
     };
     std::cout << "build=" << kBuildStamp << '\n';
     PrintNameLayout(std::cout, "live layout", read, va, window, max_hits);
+    ::CloseHandle(handle);
+}
+
+void PrintProcessWriteProbe(const std::uint32_t pid) {
+    EnableDebugPrivilegeForProbe();
+    const HANDLE handle = ::OpenProcess(
+        PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION,
+        FALSE, pid);
+    if (handle == nullptr) {
+        std::cout << "write_probe: OpenProcess failed win32_error=" << ::GetLastError()
+                  << " - run this from an elevated PowerShell\n";
+        return;
+    }
+    std::cout << "write_probe build=" << kBuildStamp << " handle=open\n";
+
+    // The native entry point is tried first on purpose: a callback that filters the Win32 wrapper but
+    // not the syscall still leaves the classic code-cave path open, and that is the difference between
+    // "Dumper-7 can run" and "external reads only".
+    const auto allocate = reinterpret_cast<NtAllocateVirtualMemoryFn>(
+        ::GetProcAddress(::GetModuleHandleW(L"ntdll.dll"), "NtAllocateVirtualMemory"));
+    const auto free_memory = reinterpret_cast<NtFreeVirtualMemoryFn>(
+        ::GetProcAddress(::GetModuleHandleW(L"ntdll.dll"), "NtFreeVirtualMemory"));
+    std::uint64_t scratch = 0;
+    bool allocated = false;
+    if (allocate == nullptr || free_memory == nullptr) {
+        std::cout << "  nt_allocate_virtual_memory=unresolved\n";
+    } else {
+        PVOID address = nullptr;
+        std::size_t size = 0x1000;
+        const NTSTATUS status = allocate(handle, &address, 0, &size, MEM_RESERVE | MEM_COMMIT,
+                                         PAGE_READWRITE);
+        std::cout << "  nt_allocate_virtual_memory=status=0x" << std::hex
+                  << static_cast<std::uint32_t>(status) << std::dec << " address=0x"
+                  << reinterpret_cast<std::uint64_t>(address) << " size=0x" << size << std::dec << '\n';
+        if (status == 0 && address != nullptr) {
+            allocated = true;
+            scratch = reinterpret_cast<std::uint64_t>(address);
+        }
+    }
+
+    bool write_tested = false;  // true only when a page we reserved ourselves was used
+    if (allocated) {
+        // A page we just reserved is the only place where a write cannot damage anything: try it there.
+        std::array<std::uint8_t, 8> pattern{0xDEU, 0xADU, 0xBEU, 0xEFU, 0x01U, 0x02U, 0x03U, 0x04U};
+        std::array<std::uint8_t, 8> before{};
+        const bool read_before = ReadRaw(handle, scratch, before.data(), before.size());
+        SIZE_T written = 0;
+        const BOOL ok = ::WriteProcessMemory(handle, reinterpret_cast<void*>(static_cast<std::uintptr_t>(scratch)),
+                                             pattern.data(), pattern.size(), &written);
+        std::array<std::uint8_t, 8> after{};
+        const bool read_after = ReadRaw(handle, scratch, after.data(), after.size());
+        std::cout << "  writeprocessmemory(target_scratch)=" << (ok != FALSE ? "ok" : "failed")
+                  << " written=" << written << " win32_error=" << ::GetLastError()
+                  << " previous_all_zero=" << (read_before && before == std::array<std::uint8_t, 8>{} ? "yes" : "no")
+                  << " readback_match=" << (read_after && after == pattern ? "yes" : "no") << '\n';
+        write_tested = true;
+        SIZE_T release_size = 0;
+        const NTSTATUS release = free_memory(handle, reinterpret_cast<PVOID*>(scratch), &release_size, MEM_RELEASE);
+        std::cout << "  nt_free_virtual_memory=status=0x" << std::hex << static_cast<std::uint32_t>(release)
+                  << std::dec << (release == 0 ? " (the scratch page was released again)" :
+                                           " (LEAK: the allocation is still mapped in the target)") << '\n';
+    }
+
+    // VirtualProtectEx with the page's own protection is a semantic no-op for the game and still has to
+    // pass the same guard, so it separates "modification syscalls are blocked" from "only allocation is".
+    const auto query = reinterpret_cast<NtQueryInformationProcessFn>(
+        ::GetProcAddress(::GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess"));
+    std::uint64_t peb = 0;
+    if (query != nullptr) {
+        PROCESS_BASIC_INFORMATION basic{};
+        if (query(handle, ProcessBasicInformation, &basic, static_cast<ULONG>(sizeof(basic)), nullptr) >= 0
+            && basic.PebBaseAddress != nullptr) {
+            peb = reinterpret_cast<std::uint64_t>(basic.PebBaseAddress);
+        }
+    }
+    if (peb != 0) {
+        MEMORY_BASIC_INFORMATION info{};
+        const SIZE_T queried = ::VirtualQueryEx(
+            handle, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(peb)), &info, sizeof(info));
+        if (queried == sizeof(info)) {
+            // VirtualProtectEx with the page's own protection is a semantic no-op for the game and still
+            // has to pass the same guard, so it separates "modification syscalls are blocked" from "only
+            // allocation is".
+            DWORD old_protection = 0;
+            const BOOL ok = ::VirtualProtectEx(
+                handle, info.BaseAddress, info.RegionSize, info.Protect, &old_protection);
+            std::cout << "  virtualprotectex(peb_page, same protection)=" << (ok != FALSE ? "ok" : "failed")
+                      << " protect=0x" << std::hex << info.Protect << " win32_error=" << ::GetLastError()
+                      << std::dec << '\n';
+        }
+    } else {
+        std::cout << "  peb=unreachable, protection no-op test skipped\n";
+    }
+    if (!allocated) {
+        std::cout << "  writeprocessmemory=not_tested deliberately: a denied remote allocation already rules"
+                     " out LoadLibrary-style injection, and writing to a game-owned page could not change"
+                     " that answer while adding a real risk to the session\n";
+    }
+
+    if (allocated && !write_tested) {
+        std::cout << "  verdict: allocation works but the write test did not run; report this line, it is"
+                     " not a normal combination\n";
+    } else if (allocated) {
+        std::cout << "  verdict: remote allocation works through ntdll!NtAllocateVirtualMemory, so the "
+                     "arc_inject path is worth rebuilding on the native call instead of VirtualAllocEx.\n";
+    } else {
+        std::cout << "  verdict: no write path could be measured; external read-only tooling is the only "
+                     "option verified so far.\n";
+    }
     ::CloseHandle(handle);
 }
 

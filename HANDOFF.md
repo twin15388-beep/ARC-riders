@@ -168,6 +168,33 @@ combine on one `Start-Process` (`-Verb RunAs` with `-RedirectStandardOutput` fai
 `AmbiguousParameterSet`); the working form is `Start-Process cmd -Verb RunAs -Wait -ArgumentList
 '/c',"<tool> probe <pid> > <file> 2>&1"`.
 
+## Injection closed as a measured fact (2026-11-13, fourth run)
+
+`arc_inject` run from an elevated shell printed `se_debug_privilege=enabled` and then
+`error: VirtualAllocEx failed ... Win32 error 5`. Combined with the earlier probe (all eight rights
+granted, `private_region_reads=5 of 5`), the target's protection filters *remote allocation*, not handle
+rights. That closes the in-process branch for this build: Dumper-7 cannot be loaded, so no hooking, no
+in-process ImGui, no engine-side world-to-screen. The architecture is fixed to an external reader plus our
+own overlay window, aim/trigger through input, and offline dump analysis for everything structural. The
+injector now calls `ntdll!NtAllocateVirtualMemory` before `VirtualAllocEx` and prints
+`nt_allocate_virtual_memory=status=0x...`, which is the last remaining way to distinguish "only the Win32
+wrapper is hooked" from "the syscall is blocked"; `arc_tool probe-write <pid>` measures the same
+allocation plus a `VirtualProtectEx` no-op and deliberately does not write to game-owned memory, because
+with allocation denied a write result could not change the plan while it would add risk to the session.
+
+The user's run also caught a usability bug of mine: the previous instruction left `$p` empty, so
+`arc_tool.exe probe` ran with no PID and the usage block landed in `probe.txt` looking like a report.
+Missing arguments now print `error: "probe" needs a PID. In PowerShell: $p=(Get-Process PioneerGame).Id`
+and exit 2. The two dump commands (marker search on `(3)`, anchored search on `(2)`) were not executed, so
+the FName entry-header question is still open for lack of a run rather than for lack of a result.
+
+Builds: `arc_tool.exe` `1,254,912` bytes, sha256
+`2e16ad4889561295da240dc362fc125c469e7a36be03af812c9af4e3f3d5080f`, stamp `2026-11-13-write-probe`,
+Dropbox rev `660275fc2ae9d4b309220`; `arc_inject.exe` `958,464` bytes, sha256
+`2ec75e420b7314eebae10394997ebbb054fbb556b9c6bbb5ce0a59924fcfba7e`, in both `/D7-build/` and
+`/Dumper7-ARC-Raiders/` (same `content_hash`, so the folder link serves the new build). Zig `-Werror`
+exit 0, `All core checks passed`. Nothing has been executed in game.
+
 ## Shortest next verification step
 
 Hex-dump 0x400 bytes at step0, 0x500 at step1, 0x300 at step2, 0x600 at step3, and 0x20 at `0x150421C80` (public viewport key-material candidate). Validate vtables, controller/local-player relationships, world/level/game-instance pointers and the encrypted viewport bank. No ESP or gameplay reads until these checks succeed.
@@ -379,6 +406,33 @@ the zip copy at `/Dumper7-ARC-Raiders/arc_inject.exe` (rev `66026fcf2d8d04b30922
 same bytes as the file inside the zip. `arc_tool.exe` build `2026-11-13-markers-priv`: `1,250,304` bytes,
 sha256 `d29c7d6afcb9d9a840a5e2de38dc9366099226b2c702ba2d48cc3f2533daa04f`, rev `66026fc83cc584b309220`.
 Core tests pass strict and under ASan/UBSan; nothing has been run in game.
+
+## Injection closed as a measured fact (2026-11-13, fourth run)
+
+`arc_inject` run from an elevated shell printed `se_debug_privilege=enabled` and then
+`error: VirtualAllocEx failed ... Win32 error 5`. Combined with the earlier probe (all eight rights
+granted, `private_region_reads=5 of 5`), the target's protection filters *remote allocation*, not handle
+rights. That closes the in-process branch for this build: Dumper-7 cannot be loaded, so no hooking, no
+in-process ImGui, no engine-side world-to-screen. The architecture is fixed to an external reader plus our
+own overlay window, aim/trigger through input, and offline dump analysis for everything structural. The
+injector now calls `ntdll!NtAllocateVirtualMemory` before `VirtualAllocEx` and prints
+`nt_allocate_virtual_memory=status=0x...`, which is the last remaining way to distinguish "only the Win32
+wrapper is hooked" from "the syscall is blocked"; `arc_tool probe-write <pid>` measures the same
+allocation plus a `VirtualProtectEx` no-op and deliberately does not write to game-owned memory, because
+with allocation denied a write result could not change the plan while it would add risk to the session.
+
+The user's run also caught a usability bug of mine: the previous instruction left `$p` empty, so
+`arc_tool.exe probe` ran with no PID and the usage block landed in `probe.txt` looking like a report.
+Missing arguments now print `error: "probe" needs a PID. In PowerShell: $p=(Get-Process PioneerGame).Id`
+and exit 2. The two dump commands (marker search on `(3)`, anchored search on `(2)`) were not executed, so
+the FName entry-header question is still open for lack of a run rather than for lack of a result.
+
+Builds: `arc_tool.exe` `1,254,912` bytes, sha256
+`2e16ad4889561295da240dc362fc125c469e7a36be03af812c9af4e3f3d5080f`, stamp `2026-11-13-write-probe`,
+Dropbox rev `660275fc2ae9d4b309220`; `arc_inject.exe` `958,464` bytes, sha256
+`2ec75e420b7314eebae10394997ebbb054fbb556b9c6bbb5ce0a59924fcfba7e`, in both `/D7-build/` and
+`/Dumper7-ARC-Raiders/` (same `content_hash`, so the folder link serves the new build). Zig `-Werror`
+exit 0, `All core checks passed`. Nothing has been executed in game.
 
 ## Shortest next verification step
 

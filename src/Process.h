@@ -50,6 +50,12 @@ void PrintProcessProbe(std::uint32_t pid);
 // (see arc::PrintNameLayout). Same measurement as `dump-fname-layout`, applied to running memory.
 void PrintProcessFNameLayout(std::uint32_t pid, std::uint64_t va, std::uint32_t window, std::size_t max_hits);
 
+// Allocation and write capability of the target, which is what decides whether any in-process tool
+// (Dumper-7 included) can be run at all. Remote allocation was measured as denied with
+// SeDebugPrivilege enabled, so this separates "the Win32 wrapper is hooked" from "the syscall is
+// blocked", and only rewrites bytes it just read when a harmless target page is not available.
+void PrintProcessWriteProbe(std::uint32_t pid);
+
 [[nodiscard]] std::string WideToUtf8(std::wstring_view value);
 [[nodiscard]] std::wstring Utf8ToWide(std::string_view value);
 [[nodiscard]] std::uint32_t ReadPeTimestamp(const Process& process, const ModuleInfo& module);

@@ -41,6 +41,7 @@ void Usage() {
         << "arc_tool dump-fname-layout <game.dmp> <VA> [window] [max_hits]  Measure the entry layout of a region\n"
         << "arc_tool live-fname-layout <pid> <VA> [window] [max_hits]  Measure the entry layout of live process memory\n"
         << "arc_tool probe <pid>                     Report which process rights are granted\n"
+        << "arc_tool probe-write <pid>              Test remote allocation and writes (decides in-process tooling)\n"
         << "arc_tool version                          Print the embedded build stamp\n"
         << "arc_tool dump-scan <game.dmp> <AOB>      Find an AOB pattern in captured memory\n"
         << "arc_tool dump-read <game.dmp> <VA> <size>  Hex-dump up to 4096 bytes\n"
@@ -172,6 +173,7 @@ int Inspect(const std::uint32_t pid, const std::filesystem::path& config_path) {
 } // namespace
 
 int main(int argc, char** argv) {
+    const std::string_view command = argc >= 2 ? std::string_view(argv[1]) : std::string_view{};
     try {
         if (argc == 2 && std::string_view(argv[1]) == "version") {
             std::cout << "arc_tool build=" << arc::kBuildStamp << '\n';
@@ -252,6 +254,10 @@ int main(int argc, char** argv) {
             arc::PrintProcessProbe(ParsePid(argv[2]));
             return 0;
         }
+        if (argc == 3 && std::string_view(argv[1]) == "probe-write") {
+            arc::PrintProcessWriteProbe(ParsePid(argv[2]));
+            return 0;
+        }
         if (argc == 4 && std::string_view(argv[1]) == "dump-rip-xrefs") {
             arc::PrintDumpRipXrefs(argv[2], arc::ParseUnsigned(argv[3]));
             return 0;
@@ -312,6 +318,25 @@ int main(int argc, char** argv) {
         }
         if (argc == 4 && std::string_view(argv[1]) == "inspect") {
             return Inspect(ParsePid(argv[2]), argv[3]);
+        }
+        // A missing argument usually means an empty PowerShell variable reached the command line
+        // ("arc_tool.exe probe" with no PID), and a usage block inside a redirected report file reads
+        // like a result. Name the argument and the variable instead.
+        static constexpr std::pair<std::string_view, std::string_view> kNeedsPid[]{
+            {{"probe"}, {"probe <pid>"}},
+            {{"probe-write"}, {"probe-write <pid>"}},
+            {{"live-fname-layout"}, {"live-fname-layout <pid> <VA> [window] [max_hits]"}},
+            {{"modules"}, {"modules <pid>"}},
+            {{"inspect"}, {"inspect <pid> <config.ini>"}},
+        };
+        for (const auto& [name, form] : kNeedsPid) {
+            if (command == name) {
+                std::cerr << "error: \"" << name << "\" needs a PID. In PowerShell:  "
+                             "$p=(Get-Process PioneerGame).Id  - and check $p is not empty before the "
+                             "call.  usage: arc_tool "
+                          << form << '\n';
+                return 2;
+            }
         }
         Usage();
         return 2;
