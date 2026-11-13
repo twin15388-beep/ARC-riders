@@ -409,8 +409,8 @@ https://www.dropbox.com/scl/fi/37w7un59wy4kc3slpw5xs/arc_tool.exe?rlkey=oes20rpm
 
 ```text
 Size:    1336320 bytes
-SHA-256: 6baa3ee53e0ae22845533411f0b7ce6215034fb26a16a19014dcd625fce97109
-build stamp: 2026-11-13-hunt
+SHA-256: 7281ea710a86d60ac2ab8916ea901bf36a0233084babfe31a6db53df529911dc
+build stamp: 2026-11-13-hunt  (Dropbox rev 6602a0754bcb24b309220)
 arc_inject.exe (впрыск закрыт измерением, оставлен для полноты): 958464 bytes
 SHA-256: 2ec75e420b7314eebae10394997ebbb054fbb556b9c6bbb5ce0a59924fcfba7e
 ```

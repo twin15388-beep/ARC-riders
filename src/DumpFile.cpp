@@ -2061,6 +2061,7 @@ void PrintDumpFNameBlocks(
             std::string hunt_best_name;
             std::uint64_t hunt_best_va = 0;
             std::set<std::uint64_t> hunt_starts;
+            bool hunt_capped = false;
             for (const auto& needle : kHuntNames) {
                 std::uint64_t per_needle = 0;
                 for (const auto& range : ranges) {
@@ -2146,8 +2147,12 @@ void PrintDumpFNameBlocks(
                             continue;
                         }
                         if (hunt_starts.size() >= 256) {
-                            std::cout << "    hunt: 256 distinct starts reached, further hits ignored\n";
-                            break;
+                            if (!hunt_capped) {
+                                hunt_capped = true;
+                                std::cout << "    hunt: 256 distinct starts reached, further hits"
+                                             " ignored\n";
+                            }
+                            continue;
                         }
                         PageBlock h;
                         h.va = back.first_entry_va;
