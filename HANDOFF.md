@@ -182,6 +182,46 @@ own code and from the Dropbox account:
   `PROCESS_VM_READ` stripped by a protection callback.
 - Added `arc_tool version` plus a build stamp (`src/Version.h`, `-DARC_BUILD_STAMP`) printed in every
   FName report, so running a stale executable cannot again be read as a negative result about the game.
+## Second run results, marker-list discovery, Dumper-7 package (2026-11-13, later the same night)
+
+`dump-fname-blocks` (build `2026-11-13-layout-probe`) on the real dump: `anchors=0`, and the new layout
+section showed why. The densest regions are NOT the name pool:
+
+```text
+ascii_run block_base=0x30a9218b runs=93 string_to_string=0x5x19,0x4x13,0x6x7,0x20x6 first="None"
+    head=00034e6f6e65004e6f6e65006e6f6e65000343616e0043616e6f6e6963616c0063616e0003436f6d00436f6d70617400636f6d0003456e6300436972636c6500
+```
+
+Byte-for-byte that is a repeated `[0x03][string A][NUL][string B][NUL][lowercase A][NUL]` table
+(`None/None/none`, `Can/Canonical/can`, `Com/Compat/com`, `Enc/Circle/enc`) — a string/alias index with a
+one-byte length tag, not `FNameEntry` records. The `partial ... len=1` entries in the `0x7ff8...` /
+`0x7fff...` ranges are both codecs misreading ASCII in system DLLs. So a single `None` anchor cannot
+distinguish "the pool was not captured" from "names are encoded", which is the only reason the search
+changed: `PrintDumpFNameBlocks` now takes a marker list (default
+`None,ByteProperty,IntProperty,FloatProperty,ObjectProperty,Class`), reports per-marker hit counts, and an
+explicit `block0_VA` that is not captured prints `anchor=0x... captured=no` and falls through to discovery
+instead of aborting — coverage and codec now answer in one run.
+
+`Dumper7-ARC-Raiders.zip` was unzipped into `/Dumper7-ARC-Raiders/` and read through the connector. It is
+not a dump output: it is the in-process package `arc_inject.exe` (956,416) + `Dumper-7.dll` (2,995,200) +
+`Dumper-7.ini` (`SDKGenerationPath=C:/Dumper-7`, `LogFilePath=C:/Dumper-7/dumper7.log`,
+`ShouldAutoUnload=1`) + `README.txt` (7 steps, run at the main menu from an administrator PowerShell).
+`arc_inject.exe` is this repo's `src/Injector.cpp`: `OpenProcess(CREATE_THREAD|QUERY_INFORMATION|
+VM_OPERATION|VM_WRITE|VM_READ)` → `VirtualAllocEx` → `WriteProcessMemory` → `CreateRemoteThread` on
+`kernel32!LoadLibraryW` → 60 s wait → `GetExitCodeThread`. It previously failed at `VirtualAllocEx`
+error 5; with the rights `probe` just measured it is worth running, and it is the shortest route to real
+class names because Dumper-7 resolves the pool with the engine's own code. Its local rebuild differs
+byte-wise from the zip copy (same source): `out/arc_inject.exe` 956,416, sha256
+`2d9274c0ddec95dd6e87c402d1d4603559bf1b9bc4857f1cbea31b2f6eb4945c`.
+
+Build `2026-11-13-markers-dumper`: size `1,249,792`, sha256
+`cfe3538fe16c3f55538c96d1f94daefbb9bab6d43803140aa5bf4f10d5a646c8`, uploaded to `/arc_tool.exe` rev
+`66026b805e8d04b309220` — the returned `content_hash` `fc9740a5...` equals `SHA256(SHA256(local file))`,
+so the Dropbox bytes are verified identical to the build in `out/`. Core tests pass strict and under
+ASan/UBSan; the dense synthetic dump still gives `PREDICATE PASS blocks=3 names=210`, the tail-dump case
+still reports the measured stride, and an uncaptured anchor now continues into discovery. Nothing has been
+run in game; ESP, Aim, Trigger, Minimap and the menu remain unimplemented.
+
 - Dropbox holds `/Dumper7-ARC-Raiders.zip` (1,504,996 bytes, rev `66015caf1db934b309220`), never
   mentioned in earlier handoffs. If it is a Dumper-7 SDK for `CL-1450810`, it covers GNames/GObjects/
   UWorld RVAs and field layouts directly and the whole section-6 recovery becomes a validation task.

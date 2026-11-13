@@ -37,7 +37,7 @@ void Usage() {
         << "arc_tool dump-xrefs <game.dmp> <VA>      Find little-endian pointers to VA\n"
         << "arc_tool dump-rip-xrefs <game.dmp> <VA>  Find RIP-relative LEA references\n"
         << "arc_tool dump-fname-pool <game.dmp> <base> <image_size>  Superseded shape scan\n"
-        << "arc_tool dump-fname-blocks <game.dmp> <base> <image_size> [block0_VA] [block_size] [min_entries] [max_blocks]  Recover the FName pool from a decodable block\n"
+        << "arc_tool dump-fname-blocks <game.dmp> <base> <image_size> [block0_VA] [block_size] [min_entries] [max_blocks] [markers]  Recover the FName pool from a decodable block\n"
         << "arc_tool dump-fname-layout <game.dmp> <VA> [window] [max_hits]  Measure the entry layout of a region\n"
         << "arc_tool live-fname-layout <pid> <VA> [window] [max_hits]  Measure the entry layout of live process memory\n"
         << "arc_tool probe <pid>                     Report which process rights are granted\n"
@@ -242,9 +242,10 @@ int main(int argc, char** argv) {
             if (block_size > UINT32_MAX || min_entries > UINT32_MAX || max_blocks > SIZE_MAX) {
                 throw std::invalid_argument("block_size/min_entries must fit uint32 and max_blocks size_t");
             }
+            const std::string_view marker_list = argc >= 10 ? argv[9] : std::string_view{};
             arc::PrintDumpFNameBlocks(argv[2], arc::ParseUnsigned(argv[3]), arc::ParseUnsigned(argv[4]),
                 anchor, static_cast<std::uint32_t>(block_size), static_cast<std::uint32_t>(min_entries),
-                static_cast<std::size_t>(max_blocks));
+                static_cast<std::size_t>(max_blocks), marker_list);
             return 0;
         }
         if (argc == 3 && std::string_view(argv[1]) == "probe") {

@@ -1141,7 +1141,8 @@ void PrintDumpFNameBlocks(
     const std::uint64_t anchor_data_va,
     const std::uint32_t block_size,
     const std::uint32_t min_entries,
-    const std::size_t max_blocks) {
+    const std::size_t max_blocks,
+    const std::string_view marker_list) {
     if (image_base == 0 || image_size == 0 || image_size > std::numeric_limits<std::uint64_t>::max() - image_base) {
         throw std::invalid_argument("invalid image range for FName block scan");
     }
@@ -1154,7 +1155,31 @@ void PrintDumpFNameBlocks(
     if (max_blocks == 0 || max_blocks > 4096) {
         throw std::invalid_argument("max_blocks must be 1..4096");
     }
-    constexpr std::string_view kExpectedFirst{"None"};
+    // One marker is not a search: the previous run proved that no captured region begins with "None"
+    // under either carried codec, so a single-marker scan cannot tell a wrong entry header apart from a
+    // pool this dump never captured. Every hit of every marker is checked, and the per-marker counts are
+    // reported, because "0 hits for all six engine-core names" is a coverage fact, not a codec fact.
+    std::vector<std::string> markers;
+    {
+        std::string current;
+        for (const char character : marker_list) {
+            if (character == ',' || character == ' ' || character == ';') {
+                if (!current.empty()) {
+                    markers.push_back(current);
+                    current.clear();
+                }
+            } else {
+                current.push_back(character);
+            }
+        }
+        if (!current.empty()) {
+            markers.push_back(current);
+        }
+    }
+    if (markers.empty()) {
+        markers = {"None", "ByteProperty", "IntProperty", "FloatProperty", "ObjectProperty", "Class"};
+    }
+    std::vector<std::uint64_t> marker_hits_for(markers.size(), 0);
     constexpr std::array<std::uint32_t, 6> kProbeSizes{{0x8, 0x10, 0x18, 0x20, 0x28, 0x30}};
     constexpr std::size_t max_anchors = 16;
     constexpr std::size_t entry_cap = 8192;
@@ -1170,8 +1195,11 @@ void PrintDumpFNameBlocks(
     const auto in_image = [&](const std::uint64_t va) { return va >= image_base && va < image_end; };
 
     std::cout << "build=" << kBuildStamp << "\nblock_size=0x" << std::hex << block_size
-              << std::dec << " min_entries=" << min_entries << " expected_first=\"" << kExpectedFirst
-              << "\" captured_ranges=" << ranges.size() << '\n';
+              << std::dec << " min_entries=" << min_entries << " markers=";
+    for (std::size_t index = 0; index < markers.size(); ++index) {
+        std::cout << (index == 0 ? "\"" : "\",\"") << markers[index];
+    }
+    std::cout << "\" captured_ranges=" << ranges.size() << '\n';
 
     std::vector<AnchorHit> anchors;
     std::vector<PartialHit> partials;  // best decoders that missed the strict gate, for layout reading
@@ -1185,8 +1213,10 @@ void PrintDumpFNameBlocks(
     if (anchor_data_va != 0) {
         const auto block = read(anchor_data_va, block_size);
         if (!block) {
-            throw std::runtime_error("the supplied block data VA is not captured in this dump");
-        }
+            std::cout << "anchor=0x" << std::hex << anchor_data_va << std::dec
+                      << " captured=no (this dump does not contain the region; falling back to marker"
+                      << " discovery)\n";
+        } else {
         const auto walk = DetectNameBlock(*block, kNameCodecCandidates, "", min_entries, entry_cap);
         if (walk.codec == nullptr) {
             std::cout << "note: the supplied VA does not decode as a dense name stream from offset 0;"
@@ -1200,7 +1230,7 @@ void PrintDumpFNameBlocks(
             walk.cap_reached,
             {},
         };
-        if (!walk.entries.empty() && walk.entries.front().text == kExpectedFirst) {
+        if (!walk.entries.empty()) {
             for (const auto& entry : walk.entries) {
                 for (const auto wanted : kWantedNames) {
                     if (entry.text == wanted) {
@@ -1210,122 +1240,135 @@ void PrintDumpFNameBlocks(
             }
         }
         anchors.push_back(std::move(anchor));
-    } else {
-        std::vector<std::uint8_t> marker;
-        marker.reserve(kExpectedFirst.size() + 1);
-        marker.assign(kExpectedFirst.begin(), kExpectedFirst.end());
-        marker.push_back(0);
-        const auto searcher = std::boyer_moore_searcher(marker.begin(), marker.end());
-        for (const auto& range : ranges) {
-            scanned_bytes += range.size;
-            if (range.size < marker.size()) {
-                continue;
-            }
-            const auto data = bytes.subspan(
-                static_cast<std::size_t>(range.file_offset), static_cast<std::size_t>(range.size));
-            for (auto current = data.begin(); current != data.end();) {
-                const auto found = std::search(current, data.end(), searcher);
-                if (found == data.end()) {
-                    break;
+        }
+    }
+    if (anchors.empty()) {
+        // Each engine-core name is searched separately, so "the pool is not captured here" and "the
+        // entry header is different" produce different reports.
+        for (std::size_t marker_index = 0; marker_index < markers.size() && anchors.empty(); ++marker_index) {
+            const std::string& expected_first = markers[marker_index];
+            std::vector<std::uint8_t> needle;
+            needle.reserve(expected_first.size() + 1);
+            needle.assign(expected_first.begin(), expected_first.end());
+            needle.push_back(0);
+            const auto searcher = std::boyer_moore_searcher(needle.begin(), needle.end());
+            for (const auto& range : ranges) {
+
+                scanned_bytes += range.size;
+                if (range.size < needle.size()) {
+                    continue;
                 }
-                ++marker_hits;
-                const auto string_at = static_cast<std::size_t>(found - data.begin());
-                for (const auto& codec : kNameCodecCandidates) {
-                    if (string_at < codec.string_offset) {
-                        continue;
+                const auto data = bytes.subspan(
+                    static_cast<std::size_t>(range.file_offset), static_cast<std::size_t>(range.size));
+                for (auto current = data.begin(); current != data.end();) {
+                    const auto found = std::search(current, data.end(), searcher);
+                    if (found == data.end()) {
+                        break;
                     }
-                    const auto base = range.va + string_at - codec.string_offset;
-                    if (base < 0x10000 || !seen_bases.insert(base).second) {
-                        continue;
-                    }
-                    const auto block = read(base, block_size);
-                    if (!block || block->size() < block_size / 2) {
-                        continue;
-                    }
-                    ++region_probes;
-                    const auto walk = WalkNameBlock(*block, codec, entry_cap);
-                    if (walk.entries.empty() || walk.entries.front().text != kExpectedFirst ||
-                        walk.entries.size() < min_entries) {
-                        const std::size_t span = std::min<std::size_t>(layout_window, block->size());
-                        auto hits = FindAsciiRuns(block->first(span), 3, 512);
-                        if (hits.size() >= 8) {
-                            RunHit candidate;
-                            candidate.base = base;
-                            candidate.runs = static_cast<std::uint32_t>(hits.size());
-                            candidate.gaps = GapHistogram(hits);
-                            candidate.first_text = hits.front().text;
-                            const auto head_span = std::min<std::size_t>(0x40, block->size());
-                            candidate.head.assign(block->begin(), block->begin() + head_span);
-                            const auto place = std::find_if(run_hits.begin(), run_hits.end(),
-                                [&candidate](const RunHit& other) { return other.base == candidate.base; });
-                            if (place == run_hits.end()) {
-                                run_hits.push_back(std::move(candidate));
-                            } else if (candidate.runs > place->runs) {
-                                *place = std::move(candidate);
-                            }
-                            std::sort(run_hits.begin(), run_hits.end(),
-                                [](const RunHit& left, const RunHit& right) { return left.runs > right.runs; });
-                            if (run_hits.size() > max_partials) {
-                                run_hits.pop_back();
-                            }
+                    ++marker_hits;
+                    ++marker_hits_for[marker_index];
+                    const auto string_at = static_cast<std::size_t>(found - data.begin());
+                    for (const auto& codec : kNameCodecCandidates) {
+                        if (string_at < codec.string_offset) {
+                            continue;
                         }
-                        hits = FindNameLikeEntries(block->first(span), kNameCodecMeasured, 512);
-                        if (hits.size() >= 4) {
-                            PartialHit partial;
-                            partial.base = base;
-                            partial.name_like = static_cast<std::uint32_t>(hits.size());
-                            partial.gaps = GapHistogram(hits);
-                            if (hits.size() > 12) {
-                                hits.resize(12);
-                            }
-                            partial.hits = std::move(hits);
-                            const auto place = std::find_if(partials.begin(), partials.end(),
-                                [&partial](const PartialHit& other) { return other.base == partial.base; });
-                            if (place == partials.end()) {
-                                partials.push_back(std::move(partial));
-                                std::sort(partials.begin(), partials.end(),
-                                    [](const PartialHit& left, const PartialHit& right) {
-                                        return left.name_like > right.name_like;
-                                    });
-                                if (partials.size() > max_partials) {
-                                    partials.pop_back();
+                        const auto base = range.va + string_at - codec.string_offset;
+                        if (base < 0x10000 || !seen_bases.insert(base).second) {
+                            continue;
+                        }
+                        const auto block = read(base, block_size);
+                        if (!block || block->size() < block_size / 2) {
+                            continue;
+                        }
+                        ++region_probes;
+                        const auto walk = WalkNameBlock(*block, codec, entry_cap);
+                        if (walk.entries.empty() || walk.entries.front().text != expected_first ||
+                            walk.entries.size() < min_entries) {
+                            const std::size_t span = std::min<std::size_t>(layout_window, block->size());
+                            auto hits = FindAsciiRuns(block->first(span), 3, 512);
+                            if (hits.size() >= 8) {
+                                RunHit candidate;
+                                candidate.base = base;
+                                candidate.runs = static_cast<std::uint32_t>(hits.size());
+                                candidate.gaps = GapHistogram(hits);
+                                candidate.first_text = hits.front().text;
+                                const auto head_span = std::min<std::size_t>(0x40, block->size());
+                                candidate.head.assign(block->begin(), block->begin() + head_span);
+                                const auto place = std::find_if(run_hits.begin(), run_hits.end(),
+                                    [&candidate](const RunHit& other) { return other.base == candidate.base; });
+                                if (place == run_hits.end()) {
+                                    run_hits.push_back(std::move(candidate));
+                                } else if (candidate.runs > place->runs) {
+                                    *place = std::move(candidate);
                                 }
-                            } else if (partial.name_like > place->name_like) {
-                                *place = std::move(partial);
-                                std::sort(partials.begin(), partials.end(),
-                                    [](const PartialHit& left, const PartialHit& right) {
-                                        return left.name_like > right.name_like;
-                                    });
+                                std::sort(run_hits.begin(), run_hits.end(),
+                                    [](const RunHit& left, const RunHit& right) { return left.runs > right.runs; });
+                                if (run_hits.size() > max_partials) {
+                                    run_hits.pop_back();
+                                }
+                            }
+                            hits = FindNameLikeEntries(block->first(span), kNameCodecMeasured, 512);
+                            if (hits.size() >= 4) {
+                                PartialHit partial;
+                                partial.base = base;
+                                partial.name_like = static_cast<std::uint32_t>(hits.size());
+                                partial.gaps = GapHistogram(hits);
+                                if (hits.size() > 12) {
+                                    hits.resize(12);
+                                }
+                                partial.hits = std::move(hits);
+                                const auto place = std::find_if(partials.begin(), partials.end(),
+                                    [&partial](const PartialHit& other) { return other.base == partial.base; });
+                                if (place == partials.end()) {
+                                    partials.push_back(std::move(partial));
+                                    std::sort(partials.begin(), partials.end(),
+                                        [](const PartialHit& left, const PartialHit& right) {
+                                            return left.name_like > right.name_like;
+                                        });
+                                    if (partials.size() > max_partials) {
+                                        partials.pop_back();
+                                    }
+                                } else if (partial.name_like > place->name_like) {
+                                    *place = std::move(partial);
+                                    std::sort(partials.begin(), partials.end(),
+                                        [](const PartialHit& left, const PartialHit& right) {
+                                            return left.name_like > right.name_like;
+                                        });
+                                }
+                            }
+                            continue;
+                        }
+                        AnchorHit anchor{
+                            base, &codec, static_cast<std::uint32_t>(walk.entries.size()), walk.consumed,
+                            walk.cap_reached, {},
+                        };
+                        for (const auto& entry : walk.entries) {
+                            for (const auto wanted : kWantedNames) {
+                                if (entry.text == wanted) {
+                                    anchor.block0_indices.emplace_back(
+                                        std::string(wanted), entry.offset / 2U);
+                                }
                             }
                         }
-                        continue;
+                        anchors.push_back(std::move(anchor));
+                        break;
                     }
-                    AnchorHit anchor{
-                        base, &codec, static_cast<std::uint32_t>(walk.entries.size()), walk.consumed,
-                        walk.cap_reached, {},
-                    };
-                    for (const auto& entry : walk.entries) {
-                        for (const auto wanted : kWantedNames) {
-                            if (entry.text == wanted) {
-                                anchor.block0_indices.emplace_back(
-                                    std::string(wanted), entry.offset / 2U);
-                            }
-                        }
+                    if (anchors.size() >= max_anchors) {
+                        break;
                     }
-                    anchors.push_back(std::move(anchor));
-                    break;
+                    current = found + 1;
                 }
                 if (anchors.size() >= max_anchors) {
                     break;
                 }
-                current = found + 1;
-            }
-            if (anchors.size() >= max_anchors) {
-                break;
             }
         }
-        std::cout << "discovery scanned_bytes=" << scanned_bytes << " marker_hits=" << marker_hits
-                  << " region_probes=" << region_probes << " anchors=" << anchors.size()
+
+        std::cout << "discovery scanned_bytes=" << scanned_bytes << " marker_hits=" << marker_hits << " (";
+        for (std::size_t index = 0; index < markers.size(); ++index) {
+            std::cout << (index == 0 ? "" : ",") << markers[index] << "=" << marker_hits_for[index];
+        }
+        std::cout << ") region_probes=" << region_probes << " anchors=" << anchors.size()
                   << (anchors.size() >= max_anchors ? " (anchor cap reached)" : "") << '\n';
     }
     for (const auto& anchor : anchors) {
@@ -1369,7 +1412,7 @@ void PrintDumpFNameBlocks(
         std::cout << "  read one of these regions in full with: dump-fname-layout <dmp> <block_base> "
                   << layout_window << " 512\n";
         std::cout << "SUMMARY build=" << kBuildStamp << " anchors=0 validated_pools=0\n";
-        std::cout << "next: no block whose first entry decodes as \"" << kExpectedFirst << "\" with "
+        std::cout << "next: no block whose first entry decodes as \"" << markers.front() << "\" with "
                   << min_entries << "+ entries exists in the captured memory. Dump the bytes around a"
                      " known name (dump-read on the block VA from the previous notes) to read the real"
                      " entry header instead of assuming shift 6 or the stock layout.\n";

@@ -58,7 +58,14 @@ pool indices (`(block << 16) | entry_offset / 2`) for the engine names the ESP c
 ```powershell
 .\arc_tool.exe dump-fname-blocks $d 0x140000000 0x139F9000
 .\arc_tool.exe dump-fname-blocks $d 0x140000000 0x139F9000 0xA6A00000   # explicit block anchor
+.\arc_tool.exe dump-fname-blocks $d 0x140000000 0x139F9000 0 0x20000 64 4096 "None,Actor"
 ```
+
+Several markers are searched, not just `None`, and the per-marker hit counts are printed
+(`marker_hits=1140 (None=1140,ByteProperty=0,...)`), because `None`-anchored discovery on the real dump
+landed on a `[0x03][A][NUL][B][NUL][lower(A)][NUL]` alias table instead of the pool. An explicit anchor VA
+that the dump did not capture prints `anchor=0x... captured=no` and falls through to marker discovery, so
+one run separates a missing region from an unknown entry header.
 
 Discovery assumes a block begins where its first entry begins, and that a `FBlockInfo`-style header of
 `0x8..0x30` bytes precedes the entry data. No 128 KB alignment of the block is assumed, and no

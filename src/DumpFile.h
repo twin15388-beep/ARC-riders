@@ -57,6 +57,12 @@ void PrintDumpFNameLayout(
     std::uint64_t va,
     std::uint32_t window_size,
     std::size_t max_hits);
+// Recovers FName pool blocks without assuming where the pool lives. `anchor_data_va` is the data VA of
+// a block already known to hold names, when one is known; if it is 0, or if that VA is not captured in
+// this dump, every captured range is searched for the start of a dense NUL-terminated name stream whose
+// first entry is one of `marker_list` (comma separated, defaults to engine-core names beginning with
+// "None"). The point of the marker list is that "no block starts with None" was already measured, so a
+// single-marker search cannot tell a wrong codec apart from a region the dump never captured.
 void PrintDumpFNameBlocks(
     const std::filesystem::path& path,
     std::uint64_t image_base,
@@ -64,7 +70,8 @@ void PrintDumpFNameBlocks(
     std::uint64_t anchor_data_va,
     std::uint32_t block_size,
     std::uint32_t min_entries,
-    std::size_t max_blocks);
+    std::size_t max_blocks,
+    std::string_view marker_list = {});
 
 } // namespace arc
 
