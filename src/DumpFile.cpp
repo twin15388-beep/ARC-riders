@@ -1140,6 +1140,103 @@ constexpr std::array<std::string_view, 9> kWantedNames{{
     "PlayerCameraManager", "PersistentLevel", "RootComponent",
 }};
 
+// Hunt needles. Chosen because they are registered dynamically (not part of the engine's static EName
+// table, so they cannot be reached from block 0) and because every shipped UE build registers them: if
+// the pool's later blocks are present in a dump at all, one of these names lives in one of them.
+constexpr std::array<std::string_view, 3> kHuntNames{{
+    "PersistentLevel", "PlayerController", "RootComponent",
+}};
+
+struct BackwardChain {
+    std::uint32_t entries{};      // well-formed names reached in front of the start position
+    std::uint32_t padding{};      // empty-name slots skipped, deliberately not counted as proof
+    std::uint64_t start_va{};     // where the walk stopped, padding included
+    std::uint64_t first_entry_va{};  // header of the oldest real name reached - the block start guess
+    bool hit_window{};            // the walk was cut off by a bound, so start_va is only a lower bound
+};
+
+// Walks the packed FName stream backwards from one entry header. Every name in a pool block is preceded
+// by a long run of entries whose declared length puts their last byte exactly at the next header (a
+// single pad byte is allowed), so depth is a strong test of "is this pool content or a string literal".
+// A 0x0000 header decodes as an empty name - the pool really does leave those in unused slots - so
+// padding is stepped over without being counted; otherwise the zero tail of a half-used block would look
+// like an infinitely deep chain.
+[[nodiscard]] BackwardChain WalkBackward(
+    const std::span<const std::uint8_t> win,
+    const std::uint64_t win_va,
+    const std::uint64_t at_header,
+    const std::uint32_t cap) {
+    BackwardChain out;
+    out.start_va = at_header;
+    if (at_header <= win_va + 3 || at_header - win_va >= win.size()) {
+        return out;
+    }
+    const auto at_end = win_va + win.size();
+    const auto header_at = [&](const std::uint64_t va) {
+        return va >= win_va && va + 2 <= at_end ? U16(win.data() + (va - win_va)) : 0U;
+    };
+    auto at = at_header;
+    out.first_entry_va = at;
+    while (out.entries + out.padding < cap) {
+        // Both bounds below assume `at` is inside the window; without this the candidate scan
+        // underflows past win_va and "walks" through a wrapped address.
+        if (at < win_va + 8) {
+            out.hit_window = true;
+            break;
+        }
+        // Long zero runs are the pool's unused slots, not a chain. Stepping over kilometres of padding
+        // would let a hit claim a block start in an unrelated region, so stop and say so instead.
+        if (out.padding >= 0x400) {
+            out.hit_window = true;
+            break;
+        }
+        const auto floor_va = std::max<std::uint64_t>(win_va + 4, at - 0x804);
+        bool stepped = false;
+        for (auto q = at - 2; q > floor_va; q -= 2) {
+            const auto header = header_at(q);
+            const std::uint64_t len = header >> 6;
+            if (len == 0) {
+                if (q + 2 == at) {
+                    at = q;
+                    ++out.padding;
+                    stepped = true;
+                    break;
+                }
+                continue;
+            }
+            // The entry spans [q, q + 2 + len); the next header starts at that end or one byte later.
+            if (q + 2 + len != at && q + 3 + len != at) {
+                continue;
+            }
+            const auto name_va = q + 2;
+            const auto name_end = std::min<std::uint64_t>(at, name_va + len);
+            if (name_va >= at_end || name_end > at_end) {
+                continue;
+            }
+            bool printable = true;
+            for (auto b = name_va; b < name_end; ++b) {
+                if (!IsNameCharacter(static_cast<char>(win[b - win_va]))) {
+                    printable = false;
+                    break;
+                }
+            }
+            if (!printable) {
+                continue;
+            }
+            at = q;
+            ++out.entries;
+            out.first_entry_va = at;  // overwritten each step, so it ends up at the oldest name
+            stepped = true;
+            break;
+        }
+        if (!stepped) {
+            break;
+        }
+    }
+    out.start_va = at;
+    return out;
+}
+
 } // namespace
 
 // Recovers the FName pool from a block whose entry stream can actually be decoded, instead of searching
@@ -1922,8 +2019,12 @@ void PrintDumpFNameBlocks(
             std::uint32_t stop_at{};
             std::uint32_t resync_gap{};
             std::vector<std::string> resync_names;
+            // Set when a wanted name was found inside this stream, which proves it is pool content
+            // regardless of how deep the chain happens to be.
+            bool proven{};
         };
         std::vector<PageBlock> sweep_blocks;
+        std::uint32_t gate_dropped = 0;
         {
             std::vector<PageBlock> hits;
             for (const auto& range : ranges) {
@@ -1949,6 +2050,130 @@ void PrintDumpFNameBlocks(
             // Expand each page hit over the whole block window, then drop any hit that sits inside an
             // earlier hit's chain: pages in the middle of a block chain too, and adjacent blocks are
             // legitimately absorbed into one continuous stream (the order is unchanged by that).
+            // Alignment-agnostic name hunt. The page pass above only tests 0x1000-aligned stream
+            // starts - which is how block 0 was found - so a pool block whose first entry is not page
+            // aligned (a general-allocator block, for instance) is invisible to it. Hunt for the bytes of
+            // kHuntNames at every alignment instead, and let the backward chain decide whether a hit is
+            // pool content or a stray string literal in module data.
+            std::uint64_t hunt_candidates = 0;
+            std::uint64_t hunt_printed = 0;
+            std::uint32_t hunt_best_depth = 0;
+            std::string hunt_best_name;
+            std::uint64_t hunt_best_va = 0;
+            std::set<std::uint64_t> hunt_starts;
+            for (const auto& needle : kHuntNames) {
+                std::uint64_t per_needle = 0;
+                for (const auto& range : ranges) {
+                    const std::string_view span(
+                        reinterpret_cast<const char*>(bytes.data() + range.file_offset),
+                        static_cast<std::size_t>(std::min<std::uint64_t>(
+                            range.size, static_cast<std::uint64_t>(
+                                std::numeric_limits<std::size_t>::max()))));
+                    std::size_t from = 0;
+                    while (from + needle.size() <= span.size()) {
+                        const auto pos = span.find(needle, from);
+                        if (pos == std::string_view::npos) {
+                            break;
+                        }
+                        from = pos + 1;
+                        const auto name_va = range.va + pos;
+                        if (name_va < 4) {
+                            continue;
+                        }
+                        // The entry header must sit immediately in front and declare exactly this length.
+                        // Read it straight out of the mapped range: a big dump holds plenty of these
+                        // names inside longer strings, and the header test is what throws them away.
+                        const std::uint16_t header_before = [&]() {
+                            if (pos >= 2) {
+                                return U16(reinterpret_cast<const std::uint8_t*>(span.data()) + pos - 2);
+                            }
+                            const auto pre = read(name_va - 2, 2);
+                            return pre ? U16(pre->data()) : std::uint16_t{0};
+                        }();
+                        if ((header_before >> 6) != needle.size()) {
+                            continue;
+                        }
+                        ++hunt_candidates;
+                        ++per_needle;
+                        // The window is clamped into the range the hit sits in: a block near the start of
+                        // a captured region has nothing in front of it *in the dump*, and shrinking is
+                        // what tells a short chain apart from an uncaptured one.
+                        std::optional<std::span<const std::uint8_t>> win;
+                        std::uint64_t win_va = 0;
+                        for (std::uint64_t want = 0x10000; want >= 0x40; want /= 4) {
+                            const auto room = name_va > range.va + want ? want : name_va - range.va;
+                            if (room < 0x40) {
+                                continue;
+                            }
+                            auto probe = read(name_va - room, room + needle.size() + 8);
+                            if (probe) {
+                                win = std::move(probe);
+                                win_va = name_va - room;
+                                break;
+                            }
+                        }
+                        if (!win) {
+                            std::cout << "    hunt \"" << needle << "\" at 0x" << std::hex
+                                      << name_va << std::dec << ": header ok, bytes before it uncaptured\n";
+                            continue;
+                        }
+                        const auto back =
+                            WalkBackward({win->data(), win->size()}, win_va, name_va - 2, 0x4000);
+                        if (hunt_printed < 24) {
+                            ++hunt_printed;
+                            std::cout << "    hunt \"" << needle << "\" at 0x" << std::hex << name_va
+                                      << std::dec << " back_entries=" << back.entries << " pad="
+                                      << back.padding << " chain_start=0x" << std::hex << back.start_va
+                                      << " first_entry=0x" << back.first_entry_va << std::dec
+                                      << (back.first_entry_va % 0x1000 == 0 ? " page-aligned"
+                                                                            : " NOT page-aligned")
+                                      << std::dec
+                                      << (back.hit_window ? " (window edge, start is a lower bound)" : "")
+                                      << '\n';
+                        }
+                        if (back.entries > hunt_best_depth) {
+                            hunt_best_depth = back.entries;
+                            hunt_best_name = std::string(needle);
+                            hunt_best_va = name_va;
+                        }
+                        if (back.entries < min_entries) {
+                            continue;
+                        }
+                        // Padding is not proof of a boundary: a block preceded by another block's zero
+                        // tail would otherwise claim a start in the middle of that tail. The oldest real
+                        // name the walk reached is the honest candidate.
+                        if (!hunt_starts.insert(back.first_entry_va).second) {
+                            continue;
+                        }
+                        if (hunt_starts.size() >= 256) {
+                            std::cout << "    hunt: 256 distinct starts reached, further hits ignored\n";
+                            break;
+                        }
+                        PageBlock h;
+                        h.va = back.first_entry_va;
+                        h.proven = true;
+                        h.first = std::string(needle);
+                        hits.push_back(std::move(h));
+                    }
+                }
+                std::cout << "  hunt \"" << needle << "\": " << per_needle
+                          << " hit(s) with a valid packed header in front\n";
+            }
+            std::cout << "  hunt: " << hunt_candidates << " packed-header candidate(s) examined, deepest"
+                         " chain in front of a hit = "
+                      << hunt_best_depth;
+            if (hunt_best_depth != 0) {
+                std::cout << " (\"" << hunt_best_name << "\" at 0x" << std::hex << hunt_best_va
+                          << std::dec << ")";
+            }
+            std::cout << '\n';
+            if (hunt_starts.empty()) {
+                std::cout << "  verdict: no occurrence of a dynamically registered name in this dump is"
+                             " preceded by " << min_entries
+                          << "+ chained entries, so the rest of the pool is not in the captured memory (or"
+                             " the packed header is wrong for names of these lengths). Capture a full"
+                             " memory dump (procdump -ma) before changing the codec again.\n";
+            }
             std::sort(hits.begin(), hits.end(),
                 [](const PageBlock& left, const PageBlock& right) { return left.va < right.va; });
             std::vector<std::pair<std::uint64_t, std::uint64_t>> covered;
@@ -1995,6 +2220,15 @@ void PrintDumpFNameBlocks(
                         }
                     }
                 }
+                // Density gate. Without it the chain test also accepts executable and rodata regions:
+                // an earlier run reported 20 "blocks", 19 of them 60-90 single-character names, and their
+                // entries shifted every ordinal in the names file. A real pool block is thousands of
+                // entries deep (block 0 holds 536 because it only carries the static EName table), so
+                // require depth, a wanted name inside the stream, or the anchor itself.
+                if (!h.proven && h.va != anchor.data_va && h.entries < 512) {
+                    ++gate_dropped;
+                    continue;
+                }
                 const auto inside = std::any_of(covered.begin(), covered.end(),
                     [&](const std::pair<std::uint64_t, std::uint64_t>& span) {
                         return h.va >= span.first && h.va < span.second;
@@ -2011,6 +2245,7 @@ void PrintDumpFNameBlocks(
         for (const auto& block : sweep_blocks) {
             sweep_names += block.entries;
         }
+        std::cout << "  sweep: " << gate_dropped << " candidate stream(s) below 512 entries dropped\n";
         std::cout << "  page sweep: " << sweep_blocks.size() << " chain-validated block(s), total_names>="
                   << sweep_names << " (a block contained in another's chain was absorbed, which keeps"
                   " order but hides boundaries)\n";
