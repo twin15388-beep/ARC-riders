@@ -1915,6 +1915,13 @@ void PrintDumpFNameBlocks(
             std::string first;
             std::string last;
             std::vector<std::pair<std::string, std::uint32_t>> wanted;  // name, ordinal inside sweep
+            // Chains that stop with block bytes left over carry the only diagnostic that matters: the
+            // raw bytes at the stop and where (and how far away) the chain restarts. Every sweep block
+            // gets it, not just the anchor, so one run explains the whole pool.
+            std::string stop_hex;
+            std::uint32_t stop_at{};
+            std::uint32_t resync_gap{};
+            std::vector<std::string> resync_names;
         };
         std::vector<PageBlock> sweep_blocks;
         {
@@ -1965,6 +1972,27 @@ void PrintDumpFNameBlocks(
                             }
                             ++local;
                         }
+                        if (walk.consumed != 0 && walk.consumed + 0x40 < blk->size()) {
+                            h.stop_at = walk.consumed;
+                            const auto from = walk.consumed > 0x10 ? walk.consumed - 0x10 : 0U;
+                            static constexpr char kHexDigits[] = "0123456789abcdef";
+                            for (std::size_t b = from; b < walk.consumed + 0x40 && b < blk->size(); ++b) {
+                                h.stop_hex.push_back(kHexDigits[(*blk)[b] >> 4]);
+                                h.stop_hex.push_back(kHexDigits[(*blk)[b] & 0xf]);
+                            }
+                            for (std::size_t off = walk.consumed + 2; off + 0x40 <= blk->size(); off += 2) {
+                                const auto probe =
+                                    WalkNameBlock({blk->data() + off, blk->size() - off}, *anchor.codec, 8);
+                                if (probe.entries.size() < 4) {
+                                    continue;
+                                }
+                                h.resync_gap = static_cast<std::uint32_t>(off - walk.consumed);
+                                for (const auto& entry : probe.entries) {
+                                    h.resync_names.push_back(entry.text);
+                                }
+                                break;
+                            }
+                        }
                     }
                 }
                 const auto inside = std::any_of(covered.begin(), covered.end(),
@@ -1993,6 +2021,20 @@ void PrintDumpFNameBlocks(
             for (const auto& [name, ordinal] : sweep_blocks[i].wanted) {
                 std::cout << "      " << name << " ordinal=" << ordinal << '\n';
             }
+            if (!sweep_blocks[i].stop_hex.empty()) {
+                std::cout << "      stop=+" << std::hex << sweep_blocks[i].stop_at << std::dec
+                          << " bytes=" << sweep_blocks[i].stop_hex << '\n';
+                if (!sweep_blocks[i].resync_names.empty()) {
+                    std::cout << "      resync=+0x" << std::hex << sweep_blocks[i].resync_gap << std::dec
+                              << " next=\"";
+                    for (std::size_t n = 0; n < sweep_blocks[i].resync_names.size(); ++n) {
+                        std::cout << (n ? "," : "") << sweep_blocks[i].resync_names[n];
+                    }
+                    std::cout << "\"\n";
+                } else {
+                    std::cout << "      resync=none-before-window-end\n";
+                }
+            }
         }
         if (sweep_blocks.size() > 64) {
             std::cout << "    ... " << (sweep_blocks.size() - 64) << " more block(s)\n";
@@ -2002,22 +2044,58 @@ void PrintDumpFNameBlocks(
                          " absorbed blocks are certainly in order; separated blocks are provisional"
                          " until the pool's block array or the usmap name table confirms it.\n";
         }
-        if (!names_out.empty() && !sweep_blocks.empty()) {
+        // Ordinals count from the anchor block: the anchor starts at the pool's first name, so every
+        // sweep block at a lower VA is some other stream that merely satisfies the chain rule (shader
+        // source, CRT data) and must not shift the numbering. Re-walk from the anchor forward once.
+        std::size_t pool_start = 0;
+        for (std::size_t i = 0; i < sweep_blocks.size(); ++i) {
+            if (sweep_blocks[i].va == anchor.data_va) {
+                pool_start = i;
+                break;
+            }
+        }
+        if (pool_start != 0) {
+            std::cout << "  ordinals counted from block[" << pool_start << "] at 0x" << std::hex
+                      << anchor.data_va << std::dec << "; " << pool_start
+                      << " lower-VA stream(s) excluded from numbering\n";
+        }
+        std::vector<std::pair<std::uint32_t, std::string>> pool_names;
+        {
+            std::uint32_t pool_ordinal = 0;
+            for (std::size_t i = pool_start; i < sweep_blocks.size(); ++i) {
+                sweep_blocks[i].wanted.clear();
+                const auto blk = read(sweep_blocks[i].va, block_size * 8);
+                if (!blk) {
+                    continue;
+                }
+                const auto walk = WalkNameBlock(*blk, *anchor.codec, entry_cap);
+                std::uint32_t local = 0;
+                for (const auto& entry : walk.entries) {
+                    for (const auto wanted : kWantedNames) {
+                        if (entry.text == wanted) {
+                            sweep_blocks[i].wanted.emplace_back(std::string(wanted), pool_ordinal + local);
+                        }
+                    }
+                    if (!names_out.empty()) {
+                        pool_names.emplace_back(pool_ordinal + local, entry.text);
+                    }
+                    ++local;
+                }
+                pool_ordinal += static_cast<std::uint32_t>(walk.entries.size());
+            }
+            if (pool_start == 0 && sweep_blocks.size() > 1) {
+                std::cout << "  note: the anchor block was not among the sweep blocks; ordinals start at"
+                             " the lowest sweep VA\n";
+            }
+        }
+        if (!names_out.empty() && !pool_names.empty()) {
             std::ofstream out(names_out.string());
             if (out) {
-                std::uint32_t ordinal = 0;
-                for (const auto& block : sweep_blocks) {
-                    const auto blk = read(block.va, block_size * 8);
-                    if (!blk) {
-                        break;
-                    }
-                    const auto walk = WalkNameBlock(*blk, *anchor.codec, entry_cap);
-                    for (const auto& entry : walk.entries) {
-                        out << ordinal << '\t' << entry.text << '\n';
-                        ++ordinal;
-                    }
+                for (const auto& [ordinal, name] : pool_names) {
+                    out << ordinal << '\t' << name << '\n';
                 }
-                std::cout << "  names written to " << names_out << " (" << ordinal << " entries)\n";
+                std::cout << "  names written to " << names_out << " (" << pool_names.size()
+                          << " entries)\n";
             } else {
                 std::cout << "  could not write names file " << names_out << '\n';
             }

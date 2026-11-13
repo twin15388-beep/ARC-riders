@@ -244,8 +244,18 @@ int main(int argc, char** argv) {
             if (block_size > UINT32_MAX || min_entries > UINT32_MAX || max_blocks > SIZE_MAX) {
                 throw std::invalid_argument("block_size/min_entries must fit uint32 and max_blocks size_t");
             }
-            const std::string_view marker_list = argc >= 10 ? argv[9] : std::string_view{};
-            const std::filesystem::path names_out = argc >= 11 ? argv[10] : std::filesystem::path{};
+            // Trailing options come in either order and PowerShell drops an empty "" argument, so
+            // classify by shape instead of position: anything ending in .txt is the names-file path.
+            std::string_view marker_list;
+            std::filesystem::path names_out;
+            for (int i = 9; i < argc; ++i) {
+                const std::string_view arg{argv[i]};
+                if (arg.size() > 4 && arg.compare(arg.size() - 4, 4, ".txt") == 0) {
+                    names_out = arg;
+                } else if (!arg.empty()) {
+                    marker_list = arg;
+                }
+            }
             arc::PrintDumpFNameBlocks(argv[2], arc::ParseUnsigned(argv[3]), arc::ParseUnsigned(argv[4]),
                 anchor, static_cast<std::uint32_t>(block_size), static_cast<std::uint32_t>(min_entries),
                 static_cast<std::size_t>(max_blocks), marker_list, names_out);
