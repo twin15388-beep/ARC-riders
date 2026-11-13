@@ -71,7 +71,8 @@ void PrintDumpFNameBlocks(
     std::uint32_t block_size,
     std::uint32_t min_entries,
     std::size_t max_blocks,
-    std::string_view marker_list = {});
+    std::string_view marker_list = {},
+    const std::filesystem::path& names_out = {});
 
 } // namespace arc
 

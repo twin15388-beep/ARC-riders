@@ -28,10 +28,9 @@ std::uint64_t LoadU64(const std::uint8_t* const bytes) {
 }
 
 bool IsWideNameCharacter(const std::uint16_t value) {
-    if (value >= 0xD800 && value <= 0xDFFF) {
-        return false;
-    }
-    return (value >= 0x21 && value <= 0x7e) || value >= 0x100;
+    // Same rule as the ANSI side: wide names are any nonzero scalar; surrogate code units are kept
+    // because pool entries legitimately store lone surrogates inside path-like names.
+    return value != 0;
 }
 
 void AppendUtf8(std::string& output, const std::uint32_t code_point) {
@@ -129,8 +128,14 @@ std::string EntryText(const std::span<const std::uint8_t> block, const NameCodec
 } // namespace
 
 bool IsNameCharacter(const char value) noexcept {
+    // Printable ASCII including space. The stop context of the real pool proved why excluding the
+    // space is wrong: block 0 chains straight through "D:/tools/steamapps/common/Arc Raiders/Engine/
+    // Binaries/ThirdParty/Windows/XAudio2_9/x64/xaudio2" - a 106-character path name whose space at
+    // 0x20 stopped the previous walk at entry 366. A name is any printable run, because the chain
+    // requirement (the next header must decode at exactly align2(2 + length)) is the actual
+    // discriminator, not the character set.
     const auto byte = static_cast<unsigned char>(value);
-    return byte >= 0x21 && byte <= 0x7e;
+    return byte >= 0x20 && byte <= 0x7e;
 }
 
 NameBlockWalk WalkNameBlock(

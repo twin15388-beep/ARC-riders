@@ -372,9 +372,9 @@ https://www.dropbox.com/scl/fi/37w7un59wy4kc3slpw5xs/arc_tool.exe?rlkey=oes20rpm
 `dump-fname-layout` + `probe`/`probe-write`):
 
 ```text
-Size:    1309184 bytes
-SHA-256: 51a614bf3a8f0d6d07ff01d834ab84732bbb7a82af2ef622e7ec3fb59ab60acc
-build stamp: 2026-11-13-pool-follow
+Size:    1327616 bytes
+SHA-256: 8e7c6af18db1ba6a047bc126f27fd9aeb523ddab07ed1e60de69455d34d5e865
+build stamp: 2026-11-13-pool-sweep
 arc_inject.exe (впрыск закрыт измерением, оставлен для полноты): 958464 bytes
 SHA-256: 2ec75e420b7314eebae10394997ebbb054fbb556b9c6bbb5ce0a59924fcfba7e
 ```
@@ -396,6 +396,12 @@ wide), stride +0x10000 не дал block 1 (блоки аллоцированы 
 `pointer-array hunt` вокруг каждого referrer: прогоняет qwords окна ±0x1000 ищет максимальный прогон
 указателей на декодируемые блоки (шаг 0x8) — это таблица блоков FNamePool; по найденному массиву
 пересчитывает ординалы wanted-имён по всему пулу и помечает массив RVA-кандидатом если он в образе.
+Седьмой прогон показал причину останова: на `+0x159a` лежит имя-путь
+`"D:/tools/steamapps/common/Arc Raiders/..."` (len=106, заголовок `8a 1a`), и предикат символа
+не пропускал пробел (0x20). Резолв: `IsNameCharacter` = 0x20..0x7e, wide-символ = любой ненулевой
+u16. Плюс добавлен page sweep: проход по всем 0x1000-выровненным позициям всех диапазонов,
+кандидат = 64+ идущие подряд packed-записи; поглощение смежных блоков в одну цепочку сохраняет
+порядок; опциональный 10-й аргумент пишет файл `ordinal\tname` для всего пула (`usmap`--ready).
 Ординалы до resync'а — нижняя граница (в выводе это сказано явно). Синтетика `syn_pack` прогоняется
 зелёно в обоих режимах (discover и explicit anchor) под ASan/UBSan.
 

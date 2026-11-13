@@ -18,6 +18,7 @@
 #include <limits>
 #include <optional>
 #include <span>
+#include <fstream>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -1152,7 +1153,8 @@ void PrintDumpFNameBlocks(
     const std::uint32_t block_size,
     const std::uint32_t min_entries,
     const std::size_t max_blocks,
-    const std::string_view marker_list) {
+    const std::string_view marker_list,
+    const std::filesystem::path& names_out) {
     if (image_base == 0 || image_size == 0 || image_size > std::numeric_limits<std::uint64_t>::max() - image_base) {
         throw std::invalid_argument("invalid image range for FName block scan");
     }
@@ -1902,11 +1904,132 @@ void PrintDumpFNameBlocks(
             }
         }
 
-        const auto block_count = std::max<std::size_t>(chain.blocks.size(), stride_blocks + 1);
+        // Page-aligned chain sweep. Block 0 was found through the "None" marker, but later blocks are
+        // not: they start at no known name, they are not adjacent (the +0x10000 stride found nothing),
+        // and no block table shows up in memory around the referrers. So every 0x1000-aligned position
+        // that opens at least min_entries chained packed entries is a block data start. The test is
+        // the chain itself, which random module code cannot satisfy at 64+ consecutive entries.
+        struct PageBlock {
+            std::uint64_t va{};
+            std::uint32_t entries{};
+            std::string first;
+            std::string last;
+            std::vector<std::pair<std::string, std::uint32_t>> wanted;  // name, ordinal inside sweep
+        };
+        std::vector<PageBlock> sweep_blocks;
+        {
+            std::vector<PageBlock> hits;
+            for (const auto& range : ranges) {
+                const auto first_aligned = (range.va + 0xfffULL) & ~0xfffULL;
+                if (first_aligned < range.va) {
+                    continue;
+                }
+                for (auto pos = first_aligned - range.va; pos + 0x40 <= range.size; pos += 0x1000) {
+                    const auto view = bytes.subspan(static_cast<std::size_t>(range.file_offset + pos),
+                        std::min<std::uint64_t>(0x1000, range.size - pos));
+                    const auto quick = WalkNameBlock(view, *anchor.codec, min_entries + 1);
+                    if (quick.entries.size() < min_entries) {
+                        continue;
+                    }
+                    PageBlock h;
+                    h.va = range.va + pos;
+                    h.entries = static_cast<std::uint32_t>(quick.entries.size());
+                    h.first = quick.entries.front().text;
+                    h.last = quick.entries.back().text;
+                    hits.push_back(std::move(h));
+                }
+            }
+            // Expand each page hit over the whole block window, then drop any hit that sits inside an
+            // earlier hit's chain: pages in the middle of a block chain too, and adjacent blocks are
+            // legitimately absorbed into one continuous stream (the order is unchanged by that).
+            std::sort(hits.begin(), hits.end(),
+                [](const PageBlock& left, const PageBlock& right) { return left.va < right.va; });
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> covered;
+            std::uint32_t running_ordinal = 0;
+            for (auto& h : hits) {
+                const auto blk = read(h.va, block_size * 8);
+                std::uint64_t end = h.va + 1;
+                if (blk) {
+                    auto walk = WalkNameBlock(*blk, *anchor.codec, entry_cap);
+                    if (!walk.entries.empty()) {
+                        h.entries = static_cast<std::uint32_t>(walk.entries.size());
+                        h.first = walk.entries.front().text;
+                        h.last = walk.entries.back().text;
+                        end = h.va + walk.consumed;
+                        std::uint32_t local = 0;
+                        for (const auto& entry : walk.entries) {
+                            for (const auto wanted : kWantedNames) {
+                                if (entry.text == wanted) {
+                                    h.wanted.emplace_back(std::string(wanted), running_ordinal + local);
+                                }
+                            }
+                            ++local;
+                        }
+                    }
+                }
+                const auto inside = std::any_of(covered.begin(), covered.end(),
+                    [&](const std::pair<std::uint64_t, std::uint64_t>& span) {
+                        return h.va >= span.first && h.va < span.second;
+                    });
+                if (inside) {
+                    continue;
+                }
+                covered.emplace_back(h.va, std::max(end, h.va + 1));
+                running_ordinal += h.entries;
+                sweep_blocks.push_back(std::move(h));
+            }
+        }
+        std::uint64_t sweep_names = 0;
+        for (const auto& block : sweep_blocks) {
+            sweep_names += block.entries;
+        }
+        std::cout << "  page sweep: " << sweep_blocks.size() << " chain-validated block(s), total_names>="
+                  << sweep_names << " (a block contained in another's chain was absorbed, which keeps"
+                  " order but hides boundaries)\n";
+        for (std::size_t i = 0; i < sweep_blocks.size() && i < 64; ++i) {
+            std::cout << "    block[" << i << "] data=0x" << std::hex << sweep_blocks[i].va << std::dec
+                      << " entries=" << sweep_blocks[i].entries << " first=\"" << sweep_blocks[i].first
+                      << "\" last=\"" << sweep_blocks[i].last << "\"\n";
+            for (const auto& [name, ordinal] : sweep_blocks[i].wanted) {
+                std::cout << "      " << name << " ordinal=" << ordinal << '\n';
+            }
+        }
+        if (sweep_blocks.size() > 64) {
+            std::cout << "    ... " << (sweep_blocks.size() - 64) << " more block(s)\n";
+        }
+        if (sweep_blocks.size() > 1) {
+            std::cout << "  note: cross-block ordinals assume VA order equals insertion order. Adjacent"
+                         " absorbed blocks are certainly in order; separated blocks are provisional"
+                         " until the pool's block array or the usmap name table confirms it.\n";
+        }
+        if (!names_out.empty() && !sweep_blocks.empty()) {
+            std::ofstream out(names_out.string());
+            if (out) {
+                std::uint32_t ordinal = 0;
+                for (const auto& block : sweep_blocks) {
+                    const auto blk = read(block.va, block_size * 8);
+                    if (!blk) {
+                        break;
+                    }
+                    const auto walk = WalkNameBlock(*blk, *anchor.codec, entry_cap);
+                    for (const auto& entry : walk.entries) {
+                        out << ordinal << '\t' << entry.text << '\n';
+                        ++ordinal;
+                    }
+                }
+                std::cout << "  names written to " << names_out << " (" << ordinal << " entries)\n";
+            } else {
+                std::cout << "  could not write names file " << names_out << '\n';
+            }
+        }
+
+        const auto block_count = std::max<std::size_t>(
+            std::max(chain.blocks.size(), stride_blocks + 1), sweep_blocks.size());
         const auto names = chain.total_entries != 0 ? chain.total_entries : stride_entries + anchor.entries;
         if (block_count > 1) {
             ++validated_pools;
-            std::cout << "PREDICATE PASS blocks=" << block_count << " names=" << names
+            std::cout << "PREDICATE PASS blocks=" << block_count << " names="
+                      << (sweep_names != 0 ? sweep_names : names)
                       << (chain.total_capped ? " (capped)" : "") << " pool_referrers_image=" << image_refs
                       << " heap=" << heap_refs << '\n';
             if (image_refs == 0) {
