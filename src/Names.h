@@ -26,20 +26,33 @@ struct NameCodec {
     std::uint32_t length_bits{};
     std::uint32_t wide_bit{};
     std::uint32_t string_offset{};
+    // When false the name bytes are followed directly by the next entry, and an odd length is padded
+    // with exactly one zero byte so the next header stays even. This packed form is what the plaintext
+    // pool region shows in both real dumps: dump-read at 0xa6f10000 of gameplay dump (3) gives
+    // 1e 01 "None" 10 03 "ByteProperty" c0 02 "IntProperty" 00 34 03 - headers carry (length << 6)
+    // plus six low bits that are not the wide flag (all observed values are even), so the packed codec
+    // never treats an entry as wide.
+    bool null_terminated{true};
 };
 
-// Measured on the plaintext FName block at 0xA6A00000 of gameplay dump (2): header immediately
-// precedes the string, length = header >> 6, bit 0 marks a wide entry.
+// The pool layout recovered from the dump bytes above: length = header >> 6, string immediately at +2,
+// no terminator, even alignment padding only. The low six header bits are carried through untouched as
+// part of the measured header word.
+inline constexpr NameCodec kNameCodecPacked{
+    "packed_shift6_no_terminator", 6, 10, 16, 2, false};
+
+// Kept only because the alias/compressed-name table (None-None-none) uses this form; the strict chain
+// walk on a real pool block rejects it, and that rejection is itself reported.
 inline constexpr NameCodec kNameCodecMeasured{
-    "measured_shift6_wide0_str2", 6, 10, 0, 2};
+    "alias_shift6_wide0_str2", 6, 10, 0, 2, true};
 
 // Stock-looking alternative kept only so a real block can reject or accept it: length in bits 0..9,
 // wide flag in bit 10.
 inline constexpr NameCodec kNameCodecLenLowBits{
-    "alt_len_bits_0_9_wide10", 0, 10, 10, 2};
+    "alt_len_bits_0_9_wide10", 0, 10, 10, 2, true};
 
-inline constexpr std::array<NameCodec, 2> kNameCodecCandidates{
-    kNameCodecMeasured, kNameCodecLenLowBits};
+inline constexpr std::array<NameCodec, 3> kNameCodecCandidates{
+    kNameCodecPacked, kNameCodecMeasured, kNameCodecLenLowBits};
 
 struct NameEntry {
     std::uint32_t offset{};  // from block data start; the low bits of an FName pool index

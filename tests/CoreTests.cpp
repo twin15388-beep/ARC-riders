@@ -415,6 +415,56 @@ void TestBackwardChain() {
         "backward chain accepted an unexplained gap");
 }
 
+void PutPackedEntry(std::vector<std::uint8_t>& bytes, std::string_view name, std::uint16_t low_bits) {
+    const auto start = bytes.size();
+    bytes.resize(start + 2 + name.size(), 0);
+    PutU16At(bytes, start, static_cast<std::uint16_t>((name.size() << 6) | low_bits));
+    std::memcpy(bytes.data() + start + 2, name.data(), name.size());
+    if ((2 + name.size()) % 2 != 0) {
+        bytes.push_back(0);  // even-alignment pad, not a terminator
+    }
+}
+
+void TestPackedCodec() {
+    // Byte layout copied from the real pool at 0xa6f10000 of gameplay dump (3): 1e 01 "None" 10 03
+    // "ByteProperty" c0 02 "IntProperty" 00 - no terminators, one zero pad after odd lengths.
+    std::vector<std::uint8_t> block;
+    PutPackedEntry(block, "None", 0x1e);
+    PutPackedEntry(block, "ByteProperty", 0x10);
+    PutPackedEntry(block, "IntProperty", 0x00);
+    PutPackedEntry(block, "BoolProperty", 0x34);
+    PutPackedEntry(block, "FloatProperty", 0x36);
+    Check(block.size() == 0x40, "packed synthetic size");
+
+    const auto walk = arc::WalkNameBlock(block, arc::kNameCodecPacked, 64);
+    Check(walk.entries.size() == 5, "packed walk entries");
+    Check(walk.consumed == block.size(), "packed walk consumed whole block");
+    Check(walk.entries.front().text == "None" && walk.entries.back().text == "FloatProperty",
+        "packed walk texts");
+
+    // The NUL-terminated codec must stop at the first entry, which is exactly why the pool was missed.
+    const auto legacy = arc::WalkNameBlock(block, arc::kNameCodecMeasured, 64);
+    Check(legacy.entries.empty(), "NUL codec accepted a terminator-less entry");
+
+    const auto hits = arc::FindNameLikeEntries(block, arc::kNameCodecPacked, 64);
+    Check(hits.size() == 5, "packed scatter count");
+    Check(hits[2].offset == 0x14 && hits[2].entry_size == 0xe, "packed scatter offsets");
+
+    // Backward chaining from the last entry reaches offset 0; a predecessor with any other size is
+    // rejected, so a mid-block anchor cannot drift.
+    const auto back = arc::BackwardNameStream(block, arc::kNameCodecPacked, hits[4].offset, 16);
+    Check(back.size() == 4 && back.front().offset == 0, "packed backward chain");
+    Check(back.size() == 4 && back.back().text == "BoolProperty", "packed backward texts");
+    const auto drift = arc::BackwardNameStream(block, arc::kNameCodecPacked, hits[4].offset + 2, 4);
+    Check(drift.empty(), "packed backward accepted an off-entry stop");
+
+    // A zero run between blocks stops the walk: real pool blocks end in padding, not names.
+    auto padded = block;
+    padded.resize(0x4000, 0);
+    const auto padded_walk = arc::WalkNameBlock(padded, arc::kNameCodecPacked, 64);
+    Check(padded_walk.entries.size() == 5 && !padded_walk.cap_reached, "packed walk stopped at padding");
+}
+
 void TestViewportDecrypt() {
     std::array<std::uint8_t, 0x100> bank{};
     const std::uint64_t lo = 0xF7149774B727E060ULL, hi = 0x642BFE20256AF201ULL;
@@ -442,6 +492,7 @@ int main() {
         TestNameBlockChain();
         TestNameLayoutProbe();
         TestBackwardChain();
+        TestPackedCodec();
         TestViewportDecrypt();
         std::cout << "All core checks passed\n";
         return 0;

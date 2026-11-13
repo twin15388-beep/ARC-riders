@@ -77,7 +77,8 @@ bool ReadEntry(
         return false;
     }
     const std::uint32_t char_width = wide ? 2U : 1U;
-    const std::uint64_t payload = static_cast<std::uint64_t>(length + 1U) * char_width;
+    const std::uint64_t payload =
+        static_cast<std::uint64_t>(length + (codec.null_terminated ? 1U : 0U)) * char_width;
     const std::uint64_t end = codec.string_offset + payload;
     if (end > block.size() - entry_offset) {
         return false;
@@ -92,8 +93,15 @@ bool ReadEntry(
             return false;
         }
     }
-    if (wide ? LoadU16(text + length * 2) != 0 : text[length] != 0) {
-        return false;
+    if (codec.null_terminated) {
+        if (wide ? LoadU16(text + length * 2) != 0 : text[length] != 0) {
+            return false;
+        }
+    } else if (((entry_offset + end) & 1U) != 0) {
+        // Packed layout: an odd payload is followed by exactly one zero pad byte before the next header.
+        if (entry_offset + end >= block.size() || block[entry_offset + end] != 0) {
+            return false;
+        }
     }
     auto next = static_cast<std::uint64_t>(entry_offset) + end;
     next = (next + 1U) & ~std::uint64_t{1};  // pool offsets are stored divided by two
@@ -201,9 +209,10 @@ std::vector<NameHit> FindNameLikeEntries(
         const auto entry = static_cast<std::uint32_t>(position - codec.string_offset);
         const auto header = LoadU16(window.data() + entry);
         const auto length = (header >> codec.length_shift) & mask;
-        const bool wide = ((header >> codec.wide_bit) & 1U) != 0;
+        const bool wide = codec.wide_bit < 16 && ((header >> codec.wide_bit) & 1U) != 0;
         const std::uint32_t char_width = wide ? 2U : 1U;
-        const std::uint64_t payload = static_cast<std::uint64_t>(length + 1U) * char_width;
+        const std::uint64_t payload =
+            static_cast<std::uint64_t>(length + (codec.null_terminated ? 1U : 0U)) * char_width;
         bool accepted = length >= 1 && length <= kMaxNameLength &&
             payload <= window.size() - position;
         if (accepted) {
@@ -212,8 +221,13 @@ std::vector<NameHit> FindNameLikeEntries(
                 accepted = wide ? IsWideNameCharacter(LoadU16(text + i * 2))
                                : IsNameCharacter(static_cast<char>(text[i]));
             }
-            if (accepted) {
+            if (accepted && codec.null_terminated) {
                 accepted = wide ? LoadU16(text + length * 2) == 0 : text[length] == 0;
+            }
+            if (accepted && !codec.null_terminated &&
+                ((position + payload) & 1U) != 0) {
+                const auto pad_at = position + payload;
+                accepted = pad_at < window.size() && window[pad_at] == 0;
             }
         }
         if (accepted) {
@@ -230,7 +244,14 @@ std::vector<NameHit> FindNameLikeEntries(
             // A pad of only 0 or 1 byte is alignment, not record padding; report it either way and let
             // the caller's histogram decide.
             hit.pad_after = pad >= 2 ? pad : 0;
-            hit.entry_size = codec.string_offset + payload + hit.pad_after;
+            // entry_size is the true stride to the next entry: even alignment counts, large zero pads
+            // count as reported. BackwardNameStream checks candidates against exactly this stride.
+            std::size_t next = terminator_end + pad;
+            if (!codec.null_terminated) {
+                next = terminator_end;
+                next += next & 1U;
+            }
+            hit.entry_size = static_cast<std::uint32_t>(next - entry);
             const auto* text = window.data() + position;
             for (std::uint32_t i = 0; i < length; ++i) {
                 const auto code = wide ? LoadU16(text + i * 2) : text[i];
@@ -295,16 +316,22 @@ std::vector<NameHit> BackwardNameStream(
             const std::uint32_t entry = position - size;
             const auto header = LoadU16(window.data() + entry);
             const auto length = (header >> codec.length_shift) & mask;
-            const bool wide = ((header >> codec.wide_bit) & 1U) != 0;
+            const bool wide = codec.wide_bit < 16 && ((header >> codec.wide_bit) & 1U) != 0;
             if (length < 1 || length > kMaxNameLength) {
                 continue;
             }
-            const std::uint32_t payload = static_cast<std::uint32_t>(length + 1U) * (wide ? 2U : 1U);
+            const std::uint32_t payload =
+                static_cast<std::uint32_t>(length + (codec.null_terminated ? 1U : 0U)) *
+                (wide ? 2U : 1U);
             if (codec.string_offset + payload > size) {
                 continue;
             }
+            if (!codec.null_terminated && size != ((codec.string_offset + payload + 1U) & ~1U)) {
+                continue;  // packed entries are exactly aligned2(header + name), nothing else
+            }
             const auto* text = window.data() + entry + codec.string_offset;
-            bool ok = wide ? LoadU16(text + length * 2) == 0 : text[length] == 0;
+            bool ok = !codec.null_terminated ||
+                (wide ? LoadU16(text + length * 2) == 0 : text[length] == 0);
             for (std::uint32_t i = 0; i < length && ok; ++i) {
                 ok = wide ? IsWideNameCharacter(LoadU16(text + i * 2))
                           : IsNameCharacter(static_cast<char>(text[i]));
@@ -472,8 +499,17 @@ void PrintNameLayout(
     // The stream report treats the supplied VA as the start of one entry. A marker search lands on
     // whatever name matched, so the block start has to be recovered by chaining backwards; the entry
     // sizes on both sides are what identify the record layout.
-    out << "\n  packed stream measured from the supplied VA as an entry start:\n";
-    const auto forward = shift(FindNameLikeEntries(tail, kNameCodecMeasured, max_hits));
+    const auto* stream_codec = &kNameCodecPacked;
+    auto forward = shift(FindNameLikeEntries(tail, *stream_codec, max_hits));
+    if (forward.size() < 3) {
+        const auto legacy = shift(FindNameLikeEntries(tail, kNameCodecMeasured, max_hits));
+        if (legacy.size() > forward.size()) {
+            forward = legacy;
+            stream_codec = &kNameCodecMeasured;
+        }
+    }
+    out << "\n  packed stream (codec=" << stream_codec->label
+        << ") measured from the supplied VA as an entry start:\n";
     std::uint32_t previous = 0;
     std::size_t shown = 0;
     for (const auto& hit : forward) {
@@ -487,7 +523,7 @@ void PrintNameLayout(
             << " pad=" << hit.pad_after << " \"" << hit.text << "\"\n";
         previous = hit.offset;
     }
-    const auto backward = BackwardNameStream(bytes, kNameCodecMeasured,
+    const auto backward = BackwardNameStream(bytes, *stream_codec,
         forward.empty() ? anchor : forward.front().offset, max_hits);
     std::uint32_t span_back = 0;  // bytes from the first entry of the backward chain to the anchor
     if (!backward.empty()) {

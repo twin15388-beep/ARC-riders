@@ -1122,7 +1122,13 @@ struct AnchorHit {
     bool capped{};
     // name -> (block 0 pool index), filled only when the block starts with the empty name. The pool
     // index is what a UObject's FName comparison field stores: (block << 16) | (entry_offset / 2).
-    std::vector<std::pair<std::string, std::uint32_t>> block0_indices;
+    struct NamedIndex {
+        std::string name;
+        std::uint32_t ordinal{};       // pool insertion order; the usmap name index
+        std::uint32_t half_offset{};   // offset / 2, the low bits of a block-0 FName number
+        std::uint32_t block{};         // block index relative to the anchor (0 for the anchor block)
+    };
+    std::vector<NamedIndex> wanted_indices;
     // True when the region was accepted on local entry density alone, without claiming that the entries
     // follow each other back to back or that a block chain was found.
     bool dense_table{};
@@ -1240,12 +1246,15 @@ void PrintDumpFNameBlocks(
             {},
         };
         if (!walk.entries.empty()) {
+            std::uint32_t ordinal = 0;
             for (const auto& entry : walk.entries) {
                 for (const auto wanted : kWantedNames) {
                     if (entry.text == wanted) {
-                        anchor.block0_indices.emplace_back(std::string(wanted), (entry.offset / 2U));
+                        anchor.wanted_indices.push_back(
+                            {std::string(wanted), ordinal, entry.offset / 2U, 0});
                     }
                 }
+                ++ordinal;
             }
         }
         if (anchor.entries >= min_entries) {
@@ -1260,10 +1269,12 @@ void PrintDumpFNameBlocks(
         // entry header is different" produce different reports.
         for (std::size_t marker_index = 0; marker_index < markers.size() && validated_anchors == 0; ++marker_index) {
             const std::string& expected_first = markers[marker_index];
+            // The raw name is searched without a trailing zero: the pool's packed entries have no
+            // terminator at all, and demanding one is what made the last two full passes miss the pool
+            // that dump-read shows in plaintext at 0xa6f10000. Candidates pay for the looser needle
+            // through the chain validation below, which is the actual gate.
             std::vector<std::uint8_t> needle;
-            needle.reserve(expected_first.size() + 1);
             needle.assign(expected_first.begin(), expected_first.end());
-            needle.push_back(0);
             const auto searcher = std::boyer_moore_searcher(needle.begin(), needle.end());
             for (const auto& range : ranges) {
 
@@ -1281,122 +1292,146 @@ void PrintDumpFNameBlocks(
                     ++marker_hits;
                     ++marker_hits_for[marker_index];
                     const auto string_at = static_cast<std::size_t>(found - data.begin());
-                    for (const auto& codec : kNameCodecCandidates) {
-                        if (string_at < codec.string_offset) {
-                            continue;
-                        }
-                        const auto base = range.va + string_at - codec.string_offset;
-                        if (base < 0x10000 || !seen_bases.insert(base).second) {
-                            continue;
-                        }
-                        const auto block = read(base, block_size);
-                        if (!block || block->size() < block_size / 2) {
-                            continue;
-                        }
-                        ++region_probes;
-                        const auto walk = WalkNameBlock(*block, codec, entry_cap);
-                        if (walk.entries.empty() || walk.entries.front().text != expected_first ||
-                            walk.entries.size() < min_entries) {
-                            const std::size_t span = std::min<std::size_t>(layout_window, block->size());
-                            auto hits = FindAsciiRuns(block->first(span), 3, 512);
-                            if (hits.size() >= 8) {
-                                RunHit candidate;
-                                candidate.base = base;
-                                candidate.runs = static_cast<std::uint32_t>(hits.size());
-                                candidate.gaps = GapHistogram(hits);
-                                candidate.first_text = hits.front().text;
-                                const auto head_span = std::min<std::size_t>(0x40, block->size());
-                                candidate.head.assign(block->begin(), block->begin() + head_span);
-                                const auto place = std::find_if(run_hits.begin(), run_hits.end(),
-                                    [&candidate](const RunHit& other) { return other.base == candidate.base; });
-                                if (place == run_hits.end()) {
-                                    run_hits.push_back(std::move(candidate));
-                                } else if (candidate.runs > place->runs) {
-                                    *place = std::move(candidate);
+                    // All three codecs read the string at offset 2 from the header, so one base is
+                    // computed per hit and every codec is tried on that base. Deduplicating the base
+                    // before probing let the first codec's failure swallow the second codec's success.
+                    constexpr std::size_t kStringOff = 2;
+                    if (string_at >= kStringOff) {
+                        const auto base = range.va + string_at - kStringOff;
+                        if (base >= 0x10000 && seen_bases.insert(base).second) {
+                            const auto block = read(base, block_size);
+                            if (block && block->size() >= block_size / 2) {
+                                ++region_probes;
+                                const NameCodec* winner = nullptr;
+                                NameBlockWalk best_walk;
+                                for (const auto& codec : kNameCodecCandidates) {
+                                    auto walk = WalkNameBlock(*block, codec, entry_cap);
+                                    if (walk.entries.empty() ||
+                                        walk.entries.front().text != expected_first ||
+                                        walk.entries.size() < min_entries) {
+                                        continue;
+                                    }
+                                    winner = &codec;
+                                    best_walk = std::move(walk);
+                                    break;
                                 }
-                                std::sort(run_hits.begin(), run_hits.end(),
-                                    [](const RunHit& left, const RunHit& right) { return left.runs > right.runs; });
-                                if (run_hits.size() > max_partials) {
-                                    run_hits.pop_back();
-                                }
-                            }
-                            // A region whose entries are individually decodable but not back to back is still a name table:
-                        // chaining is a property of the pool block layout, not of the entry header. Density
-                        // alone therefore qualifies, and the referrer sweep on it is what can yield GNames.
-                        const auto dense = FindNameLikeEntries(*block, kNameCodecMeasured, 8192);
-                        if (dense.size() >= min_entries) {
-                            AnchorHit table;
-                            table.data_va = base;
-                            table.codec = &kNameCodecMeasured;
-                            table.entries = static_cast<std::uint32_t>(dense.size());
-                            table.consumed = dense.empty()
-                                ? 0U
-                                : dense.back().offset + dense.back().entry_size;
-                            table.capped = dense.size() >= 8192;
-                            table.dense_table = true;
-                            for (const auto& hit : dense) {
-                                for (const auto wanted : kWantedNames) {
-                                    if (hit.text == wanted) {
-                                        table.block0_indices.emplace_back(std::string(wanted), hit.offset / 2U);
+                                if (winner != nullptr) {
+                                    AnchorHit anchor{
+                                        base, winner, static_cast<std::uint32_t>(best_walk.entries.size()),
+                                        best_walk.consumed, best_walk.cap_reached, {},
+                                    };
+                                    std::uint32_t ordinal = 0;
+                                    for (const auto& entry : best_walk.entries) {
+                                        for (const auto wanted : kWantedNames) {
+                                            if (entry.text == wanted) {
+                                                anchor.wanted_indices.push_back(
+                                                    {std::string(wanted), ordinal, entry.offset / 2U, 0});
+                                            }
+                                        }
+                                        ++ordinal;
+                                    }
+                                    if (anchor.entries >= min_entries) {
+                                        ++validated_anchors;
+                                    }
+                                    anchors.push_back(std::move(anchor));
+                                } else {
+                                    const std::size_t span =
+                                        std::min<std::size_t>(layout_window, block->size());
+                                    auto hits = FindAsciiRuns(block->first(span), 3, 512);
+                                    if (hits.size() >= 8) {
+                                        RunHit candidate;
+                                        candidate.base = base;
+                                        candidate.runs = static_cast<std::uint32_t>(hits.size());
+                                        candidate.gaps = GapHistogram(hits);
+                                        candidate.first_text = hits.front().text;
+                                        const auto head_span = std::min<std::size_t>(0x40, block->size());
+                                        candidate.head.assign(block->begin(), block->begin() + head_span);
+                                        const auto place = std::find_if(run_hits.begin(), run_hits.end(),
+                                            [&candidate](const RunHit& other) {
+                                                return other.base == candidate.base;
+                                            });
+                                        if (place == run_hits.end()) {
+                                            run_hits.push_back(std::move(candidate));
+                                        } else if (candidate.runs > place->runs) {
+                                            *place = std::move(candidate);
+                                        }
+                                        std::sort(run_hits.begin(), run_hits.end(),
+                                            [](const RunHit& left, const RunHit& right) {
+                                                return left.runs > right.runs;
+                                            });
+                                        if (run_hits.size() > max_partials) {
+                                            run_hits.pop_back();
+                                        }
+                                    }
+                                    // A region that chains hundreds of packed entries is a name table even
+                                    // when the searched marker is not its first entry. Acceptance is the
+                                    // chained walk, never a scatter count: the NUL-codec scatter produced
+                                    // 257 "tables" in random module code, which is pure noise.
+                                    const auto dense = MeasureNameBlock(*block, kNameCodecPacked, 8192);
+                                    if (dense.entries >= min_entries) {
+                                        AnchorHit table;
+                                        table.data_va = base;
+                                        table.codec = &kNameCodecPacked;
+                                        table.entries = dense.entries;
+                                        table.consumed = dense.consumed;
+                                        table.capped = dense.cap_reached;
+                                        table.dense_table = true;
+                                        const auto wanted_walk =
+                                            WalkNameBlock(*block, kNameCodecPacked, 8192);
+                                        std::uint32_t ordinal = 0;
+                                        for (const auto& entry : wanted_walk.entries) {
+                                            for (const auto wanted : kWantedNames) {
+                                                if (entry.text == wanted) {
+                                                    table.wanted_indices.push_back(
+                                                        {std::string(wanted), ordinal, entry.offset / 2U, 0});
+                                                }
+                                            }
+                                            ++ordinal;
+                                        }
+                                        const auto place = std::find_if(dense_tables.begin(),
+                                            dense_tables.end(), [&table](const AnchorHit& other) {
+                                                return other.data_va == table.data_va;
+                                            });
+                                        if (place == dense_tables.end()) {
+                                            dense_tables.push_back(std::move(table));
+                                        } else if (table.entries > place->entries) {
+                                            *place = std::move(table);
+                                        }
+                                    }
+                                    hits = FindNameLikeEntries(block->first(span), kNameCodecPacked, 512);
+                                    if (hits.size() >= 4) {
+                                        PartialHit partial;
+                                        partial.base = base;
+                                        partial.name_like = static_cast<std::uint32_t>(hits.size());
+                                        partial.gaps = GapHistogram(hits);
+                                        if (hits.size() > 12) {
+                                            hits.resize(12);
+                                        }
+                                        partial.hits = std::move(hits);
+                                        const auto place = std::find_if(partials.begin(), partials.end(),
+                                            [&partial](const PartialHit& other) {
+                                                return other.base == partial.base;
+                                            });
+                                        if (place == partials.end()) {
+                                            partials.push_back(std::move(partial));
+                                            std::sort(partials.begin(), partials.end(),
+                                                [](const PartialHit& left, const PartialHit& right) {
+                                                    return left.name_like > right.name_like;
+                                                });
+                                            if (partials.size() > max_partials) {
+                                                partials.pop_back();
+                                            }
+                                        } else if (partial.name_like > place->name_like) {
+                                            *place = std::move(partial);
+                                            std::sort(partials.begin(), partials.end(),
+                                                [](const PartialHit& left, const PartialHit& right) {
+                                                    return left.name_like > right.name_like;
+                                                });
+                                        }
                                     }
                                 }
                             }
-                            const auto place = std::find_if(dense_tables.begin(), dense_tables.end(),
-                                [&table](const AnchorHit& other) { return other.data_va == table.data_va; });
-                            if (place == dense_tables.end()) {
-                                dense_tables.push_back(std::move(table));
-                            } else if (table.entries > place->entries) {
-                                *place = std::move(table);
-                            }
                         }
-                            hits = FindNameLikeEntries(block->first(span), kNameCodecMeasured, 512);
-                            if (hits.size() >= 4) {
-                                PartialHit partial;
-                                partial.base = base;
-                                partial.name_like = static_cast<std::uint32_t>(hits.size());
-                                partial.gaps = GapHistogram(hits);
-                                if (hits.size() > 12) {
-                                    hits.resize(12);
-                                }
-                                partial.hits = std::move(hits);
-                                const auto place = std::find_if(partials.begin(), partials.end(),
-                                    [&partial](const PartialHit& other) { return other.base == partial.base; });
-                                if (place == partials.end()) {
-                                    partials.push_back(std::move(partial));
-                                    std::sort(partials.begin(), partials.end(),
-                                        [](const PartialHit& left, const PartialHit& right) {
-                                            return left.name_like > right.name_like;
-                                        });
-                                    if (partials.size() > max_partials) {
-                                        partials.pop_back();
-                                    }
-                                } else if (partial.name_like > place->name_like) {
-                                    *place = std::move(partial);
-                                    std::sort(partials.begin(), partials.end(),
-                                        [](const PartialHit& left, const PartialHit& right) {
-                                            return left.name_like > right.name_like;
-                                        });
-                                }
-                            }
-                            continue;
-                        }
-                        AnchorHit anchor{
-                            base, &codec, static_cast<std::uint32_t>(walk.entries.size()), walk.consumed,
-                            walk.cap_reached, {},
-                        };
-                        for (const auto& entry : walk.entries) {
-                            for (const auto wanted : kWantedNames) {
-                                if (entry.text == wanted) {
-                                    anchor.block0_indices.emplace_back(
-                                        std::string(wanted), entry.offset / 2U);
-                                }
-                            }
-                        }
-                        if (anchor.entries >= min_entries) {
-                            ++validated_anchors;
-                        }
-                        anchors.push_back(std::move(anchor));
-                        break;
                     }
                     if (anchors.size() >= max_anchors + supplied_anchors) {
                         break;
@@ -1469,13 +1504,6 @@ void PrintDumpFNameBlocks(
                   << " codec=" << anchor.codec->label << " entries=" << anchor.entries
                   << (anchor.capped ? "+" : "") << " consumed=0x" << std::hex << anchor.consumed
                   << std::dec << '\n';
-        if (!anchor.block0_indices.empty()) {
-            std::cout << "  block0 FName indices (block 0, so (0 << 16) | offset / 2):\n";
-            for (const auto& [name, index] : anchor.block0_indices) {
-                std::cout << "    " << name << " index=0x" << std::hex << index << std::dec << " ("
-                          << index << ")\n";
-            }
-        }
     }
     if (!dense_tables.empty()) {
         std::cout << "\ndense name tables accepted on local entry density (" << dense_tables.size()
@@ -1565,9 +1593,9 @@ void PrintDumpFNameBlocks(
                       << " entries=" << table.entries << (table.capped ? "+" : "") << " span=0x"
                       << std::hex << table.consumed << std::dec << " referrers image="
                       << ref_counts[i].first << " heap=" << ref_counts[i].second << '\n';
-            for (const auto& [name, index] : table.block0_indices) {
-                std::cout << "    wanted name \"" << name << "\" entry_offset=0x" << std::hex
-                          << (index * 2U) << std::dec << '\n';
+            for (const auto& wi : table.wanted_indices) {
+                std::cout << "    wanted name \"" << wi.name << "\" ordinal=" << wi.ordinal
+                          << " entry_offset=0x" << std::hex << (wi.half_offset * 2U) << std::dec << '\n';
             }
             std::cout << "  measure it: dump-fname-layout <dmp> 0x" << std::hex << table.data_va
                       << std::dec << " 0x800 512\n";
@@ -1611,7 +1639,7 @@ void PrintDumpFNameBlocks(
     }
 
     std::size_t validated_pools = 0;
-    for (const auto& anchor : anchors) {
+    for (auto& anchor : anchors) {
         std::cout << "\n=== anchor block_data=0x" << std::hex << anchor.data_va << std::dec << " ===\n";
         if (anchor.data_va > 0x40) {
             PrintHexWindow("bytes_before_block", read(anchor.data_va - 0x40, 0x40));
@@ -1656,10 +1684,17 @@ void PrintDumpFNameBlocks(
         }
 
         // Second allocator shape: blocks laid out back to back instead of chained through headers.
+        // When the winning codec is the packed pool form, also test half the configured step: real
+        // FNamePool blocks are 0x10000 apart while the scan probes a coarser grid.
         std::uint64_t stride_entries = 0;
         std::size_t stride_blocks = 0;
+        std::uint64_t stride_step = block_size;
+        if (anchor.codec == &kNameCodecPacked && block_size >= 0x20000) {
+            stride_step = 0x10000;
+        }
+        std::uint32_t running_ordinal = anchor.entries;  // block 0 is walked fully for the anchor
         for (std::size_t index = 1; index < max_blocks; ++index) {
-            const auto step = static_cast<std::uint64_t>(block_size);
+            const auto step = stride_step;
             if (anchor.data_va > std::numeric_limits<std::uint64_t>::max() - index * step) {
                 break;
             }
@@ -1672,8 +1707,35 @@ void PrintDumpFNameBlocks(
             if (walk.codec == nullptr) {
                 break;
             }
+            // Pool ordinals are insertion order across blocks, so the wanted names found in a stride
+            // block get anchor.entries + everything counted before it. The USMAP stores exactly these
+            // numbers as name indices.
+            std::uint32_t local = 0;
+            for (const auto& entry : walk.entries) {
+                for (const auto wanted : kWantedNames) {
+                    if (entry.text == wanted) {
+                        anchor.wanted_indices.push_back(
+                            {std::string(wanted), running_ordinal + local, entry.offset / 2U,
+                             static_cast<std::uint32_t>(index)});
+                    }
+                }
+                ++local;
+            }
             ++stride_blocks;
             stride_entries += walk.entries.size();
+            running_ordinal += walk.entries.size();
+        }
+        if (!anchor.wanted_indices.empty()) {
+            std::cout << "  wanted names with pool ordinals (ordinal is the usmap name index; "
+                          "half_offset is the low 16 bits of the FName number, (block << 16) | half):\n";
+            std::sort(anchor.wanted_indices.begin(), anchor.wanted_indices.end(),
+                [](const AnchorHit::NamedIndex& l, const AnchorHit::NamedIndex& r) {
+                    return l.ordinal < r.ordinal;
+                });
+            for (const auto& wi : anchor.wanted_indices) {
+                std::cout << "    " << wi.name << " block=" << wi.block << " ordinal=" << wi.ordinal
+                          << " half_offset=0x" << std::hex << wi.half_offset << std::dec << '\n';
+            }
         }
         std::cout << "  stride_blocks=" << stride_blocks << " stride_entries=" << stride_entries
                   << " (further blocks at block_size intervals that still decode as name streams)\n";
