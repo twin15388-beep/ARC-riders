@@ -658,6 +658,31 @@ void TestEspConfigAndRows() {
         "trigger fires far outside the box");
     Check(!rows[1].projected || !arc::IsOnAimPoint(rows[1], -1.0, -1.0, 0.0), "trigger fires off-screen");
 
+    // Argument handling, which is the part a Windows-only main() cannot be tested in.
+    const auto overlay_one = arc::ParseOverlayArgs({"page.html"});
+    Check(overlay_one && overlay_one->html == "page.html" && !overlay_one->demo, "overlay: single arg");
+    const auto overlay_demo = arc::ParseOverlayArgs({"page.html", "demo"});
+    Check(overlay_demo && overlay_demo->demo, "overlay: demo flag rejected");
+    Check(!arc::ParseOverlayArgs({"page.html", "Demo"}).has_value(), "overlay: unknown flag accepted");
+    Check(!arc::ParseOverlayArgs({}).has_value(), "overlay: no argument accepted");
+    Check(!arc::ParseOverlayArgs({"a.html", "demo", "extra"}).has_value(), "overlay: extra argument accepted");
+    Check(arc::ParseConfigArgs({"esp.ini"}).has_value() && !arc::ParseConfigArgs({}).has_value(),
+        "config: argument count");
+    const auto export_full = arc::ParseExportArgs(
+        {"game.dmp", "0x140000000", "0x139F9000", "esp.ini", "esp-data.js"});
+    Check(export_full && export_full->base == 0x140000000ULL && export_full->image_size == 0x139F9000ULL &&
+        export_full->config == "esp.ini" && export_full->out == "esp-data.js" && export_full->rows == 4096,
+        "export: full form");
+    const auto export_min = arc::ParseExportArgs({"game.dmp", "0x1000", "0x2000", "esp.ini"});
+    Check(export_min && export_min->out.empty() && export_min->rows == 4096, "export: minimal form");
+    const auto export_rows = arc::ParseExportArgs({"g.dmp", "0x1000", "0x2000", "c.ini", "o.js", "25"});
+    Check(export_rows && export_rows->rows == 25, "export: row limit ignored");
+    Check(!arc::ParseExportArgs({"g.dmp", "0x1000", "0x2000"}).has_value(), "export: missing config accepted");
+    Check(!arc::ParseExportArgs({"g.dmp", "notanumber", "0x2000", "c.ini"}).has_value(),
+        "export: unparsable base accepted");
+    Check(!arc::ParseExportArgs({"g.dmp", "0x1000", "0", "c.ini"}).has_value(),
+        "export: zero image size accepted");
+
     const auto demo = arc::DemoOverlayData();
     Check(demo.rfind("window.ARC = ", 0) == 0, "demo data is not a js assignment");
     Check(demo.find("\"actors_with_position\": 12") != std::string::npos, "demo rows missing");

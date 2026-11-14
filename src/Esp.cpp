@@ -1,5 +1,7 @@
 #include "Esp.h"
 
+#include "Chain.h"  // arc::ParseUnsigned
+
 #include <algorithm>
 #include <charconv>
 #include <cmath>
@@ -419,6 +421,97 @@ bool ReadLocalView(const IMemory& memory, std::uint64_t player_controller, const
         }
     }
     return true;
+}
+
+namespace {
+
+[[nodiscard]] bool HasSuffix(const std::string_view text, std::string_view suffix) {
+    return text.size() >= suffix.size() &&
+        text.compare(text.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+[[nodiscard]] bool Number(const std::string_view text, std::uint64_t* out) {
+    try {
+        const auto value = ParseUnsigned(text);
+        if (out != nullptr) {
+            *out = value;
+        }
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+}  // namespace
+
+std::filesystem::path SiblingPath(const std::filesystem::path& file, const std::string_view name) {
+    auto text = file.string();
+    const auto cut = text.find_last_of("/\\");
+    if (cut == std::string::npos) {
+        return std::filesystem::path(std::string(name));  // the page sits in the working directory
+    }
+    return std::filesystem::path(text.substr(0, cut + 1) + std::string(name));
+}
+
+std::optional<OverlayRequest> ParseOverlayArgs(const std::vector<std::string_view>& args) {
+    if (args.empty() || args.size() > 2) {
+        return std::nullopt;
+    }
+    OverlayRequest request;
+    request.html = std::string(args[0]);
+    if (args.size() == 2) {
+        if (args[1] != "demo") {
+            return std::nullopt;  // a typo here must not silently skip the demo file
+        }
+        request.demo = true;
+    }
+    return request;
+}
+
+std::optional<ConfigRequest> ParseConfigArgs(const std::vector<std::string_view>& args) {
+    if (args.size() != 1) {
+        return std::nullopt;
+    }
+    return ConfigRequest{std::string(args[0])};
+}
+
+std::optional<ExportRequest> ParseExportArgs(const std::vector<std::string_view>& args) {
+    if (args.size() < 4) {
+        return std::nullopt;
+    }
+    ExportRequest request;
+    request.dump = std::string(args[0]);
+    if (!Number(args[1], &request.base) || !Number(args[2], &request.image_size) || request.base == 0 ||
+        request.image_size == 0) {
+        return std::nullopt;
+    }
+    // The tail is classified by shape, not position: PowerShell is free to drop an empty "" argument, and
+    // ".ini/.txt/.cfg" is always the config while ".js/.json" is always the output.
+    bool have_rows = false;
+    for (std::size_t i = 3; i < args.size(); ++i) {
+        const auto arg = args[i];
+        if (HasSuffix(arg, ".js") || HasSuffix(arg, ".json")) {
+            request.out = std::string(arg);
+            continue;
+        }
+        if (HasSuffix(arg, ".ini") || HasSuffix(arg, ".txt") || HasSuffix(arg, ".cfg")) {
+            if (request.config.empty()) {
+                request.config = std::string(arg);
+            } else {
+                request.out = std::string(arg);
+            }
+            continue;
+        }
+        if (!have_rows && Number(arg, &request.rows)) {
+            have_rows = true;
+            continue;
+        }
+        return std::nullopt;
+    }
+    if (request.config.empty()) {
+        return std::nullopt;
+    }
+    return request;
 }
 
 std::optional<AimPick> SelectAimTarget(const std::vector<EspActor>& rows, const double aim_x,

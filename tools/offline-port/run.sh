@@ -57,6 +57,16 @@ grep -q "distance 0\\.\\." "$work/manual.txt" || fail "the local actor should be
 grep -q "off view" "$work/manual.txt" || fail "the row at the eye should be reported as off view"
 grep -q '"actors_with_position": 64' "$work/manual.json" || fail "manual config did not export rows"
 
+# the argument handling itself: the shipped modes used to fall through to the usage text because an
+# `argc == 3` check sat next to an `argc == 4` one, and only `demo` proved it
+"$out/probe" esp-overlay "$work/overlay.html" demo > "$work/overlay.txt" || fail "esp-overlay rejected demo"
+grep -q "demo esp-data.js" "$work/overlay.txt" || fail "esp-overlay did not report the demo file"
+[ -s "$work/overlay.html" ] || fail "esp-overlay wrote an empty page"
+grep -q "<canvas" "$work/overlay.html" || fail "the page it wrote is not the viewer"
+[ -s "$work/esp-data.js" ] || fail "the demo data file is missing next to the page"
+"$out/probe" esp-overlay 2>/dev/null && fail "esp-overlay accepted no arguments"
+"$out/probe" esp-overlay "$work/x.html" not-a-flag 2>/dev/null && fail "esp-overlay accepted an unknown flag"
+
 # and the modes that already shipped must keep answering on their fixtures
 "$out/probe" esp-chain "$work/syn_esp.dmp" 0x140000000 0x2000 0x1000 "0xA0,0x8,0x8" "$work/bad.ini" \
     > "$work/bad.txt"

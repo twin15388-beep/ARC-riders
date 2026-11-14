@@ -171,6 +171,36 @@ struct AimPick {
 // page draws boxes, the reader, the maths and the renderer are fine and only the offsets are missing.
 [[nodiscard]] std::string DemoOverlayData();
 
+// Argument handling lives here rather than in main(), because a Windows-only main() cannot be exercised
+// offline, and an `argc == 3` written next to an `argc == 4` check silently turns a subcommand into a usage
+// print - measured, when `esp-overlay out.html demo` fell through to the help text. These parsers take the
+// tail of argv and either return a request or nothing at all, so the shell shape is unit-testable.
+struct OverlayRequest {
+    std::filesystem::path html;
+    bool demo{};
+};
+[[nodiscard]] std::optional<OverlayRequest> ParseOverlayArgs(const std::vector<std::string_view>& args);
+
+struct ConfigRequest {
+    std::filesystem::path ini;
+};
+[[nodiscard]] std::optional<ConfigRequest> ParseConfigArgs(const std::vector<std::string_view>& args);
+
+struct ExportRequest {
+    std::filesystem::path dump;
+    std::filesystem::path config;
+    std::filesystem::path out;
+    std::uint64_t base{};
+    std::uint64_t image_size{};
+    std::uint64_t rows{4096};
+};
+[[nodiscard]] std::optional<ExportRequest> ParseExportArgs(const std::vector<std::string_view>& args);
+
+// A file next to `file`, by name. Done at string level instead of path::operator/ because the page's
+// directory is what matters and the separator is whatever the platform already used - which also keeps this
+// callable from the Linux harness, where a wide-native path append cannot be converted back.
+[[nodiscard]] std::filesystem::path SiblingPath(const std::filesystem::path& file, std::string_view name);
+
 // The overlay page that consumes ToJson's output. Emitted by the tool rather than kept as a separate asset
 // so `arc_tool esp-overlay <out.html>` plus `esp-export ... esp-data.js` in one folder is the whole setup.
 [[nodiscard]] std::string OverlayHtml();

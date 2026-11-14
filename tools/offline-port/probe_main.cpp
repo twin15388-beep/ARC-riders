@@ -2,11 +2,13 @@
 // offline dump modes only, so `tools/offline-port/build.sh && tools/offline-port/run.sh` can gate a change
 // against tools/offline-port/mkesp.py without a Windows box and without touching the live game.
 #include "DumpFile.h"
+#include "Esp.h"
 
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -71,37 +73,32 @@ int main(int argc, char** argv) try {
             chain_list, ini_out);
         return 0;
     }
-    if (mode == "esp-export" && argc >= 4) {
-        std::filesystem::path config_path;
-        std::filesystem::path out_path;
-        std::uint64_t limit = 4096;
-        bool have_limit = false;
-        for (int i = 5; i < argc; ++i) {
-            const std::string_view arg{argv[i]};
-            if (EndsWith(arg, ".js") || EndsWith(arg, ".json")) {
-                out_path = arg;
-                continue;
-            }
-            if (EndsWith(arg, ".ini") || EndsWith(arg, ".txt") || EndsWith(arg, ".cfg")) {
-                if (config_path.empty()) {
-                    config_path = arg;
-                } else {
-                    out_path = arg;
-                }
-                continue;
-            }
-            if (!have_limit) {
-                limit = ParseUnsigned(arg);
-                have_limit = true;
-                continue;
-            }
-            throw std::invalid_argument("esp-export takes [out.js] [row_limit] after the config");
+    if (mode == "esp-export") {
+        // The same parser the Windows main() uses, so the gate exercises the shipped argument handling.
+        const auto request = arc::ParseExportArgs({argv + 2, argv + argc});
+        if (!request) {
+            throw std::invalid_argument("esp-export <dmp> <base> <size> <config.ini> [out.js] [rows]");
         }
-        if (config_path.empty()) {
-            throw std::invalid_argument("esp-export needs a config ini");
+        arc::PrintDumpEspExport(request->dump, request->base, request->image_size, request->config,
+            request->out, static_cast<std::size_t>(request->rows));
+        return 0;
+    }
+    if (mode == "esp-overlay") {
+        const auto request = arc::ParseOverlayArgs({argv + 2, argv + argc});
+        if (!request) {
+            throw std::invalid_argument("esp-overlay <out.html> [demo]");
         }
-        arc::PrintDumpEspExport(argv[2], ParseUnsigned(argv[3]), ParseUnsigned(argv[4]), config_path,
-            out_path, static_cast<std::size_t>(limit));
+        std::ofstream page(request->html.string());
+        if (!page) {
+            throw std::invalid_argument("cannot write " + request->html.string());
+        }
+        page << arc::OverlayHtml();
+        if (request->demo) {
+            std::ofstream js(arc::SiblingPath(request->html, "esp-data.js").string());
+            js << arc::DemoOverlayData();
+        }
+        std::cout << "overlay written to " << request->html.string()
+                  << (request->demo ? " (plus demo esp-data.js)" : "") << "\n";
         return 0;
     }
     if (mode == "esp-actors" && argc >= 4) {

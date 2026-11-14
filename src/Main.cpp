@@ -25,13 +25,6 @@
 
 namespace {
 
-// An argument is an output path when it ends in a suffix we write, and a number when it parses as one.
-// Classification beats position because PowerShell drops an empty "" positional without telling anyone.
-[[nodiscard]] bool EndsWithView(std::string_view text, std::string_view suffix) {
-    return text.size() >= suffix.size() &&
-        text.compare(text.size() - suffix.size(), suffix.size(), suffix) == 0;
-}
-
 void PrintAddress(const std::uintptr_t address) {
     std::cout << "0x" << std::hex << std::uppercase << std::setw(16) << std::setfill('0') << address
               << std::dec << std::nouppercase << std::setfill(' ');
@@ -281,31 +274,44 @@ int main(int argc, char** argv) {
                 static_cast<std::size_t>(max_blocks), marker_list, names_out);
             return 0;
         }
-        if (argc == 3 && std::string_view(argv[1]) == "esp-overlay") {
-            // Writes the viewer next to the data file `esp-export` produces. No dependencies, no server.
-            std::ofstream out(argv[2]);
+        if (std::string_view(argv[1]) == "esp-overlay") {
+            const auto request = arc::ParseOverlayArgs({argv + 2, argv + argc});
+            if (!request) {
+                std::cout << "usage: arc_tool esp-overlay <out.html> [demo]\n";
+                return 2;
+            }
+            std::ofstream out(request->html.string());
             if (!out) {
-                throw std::invalid_argument(std::string("cannot write ") + argv[2]);
+                throw std::invalid_argument("cannot write " + request->html.string());
             }
             out << arc::OverlayHtml();
-            std::cout << "overlay written to " << argv[2]
+            std::cout << "overlay written to " << request->html.string()
                       << "\nopen it in a browser and keep esp-data.js in the same folder\n";
-            if (argc == 4 && std::string_view(argv[3]) == "demo") {
-                // A folder next to the html: the page draws a dozen synthetic actors, which is how to tell
-                // "the renderer is fine" apart from "the offsets are wrong".
-                const std::filesystem::path data{std::filesystem::path(argv[2]).parent_path() /
-                    "esp-data.js"};
+            if (request->demo) {
+                // Same folder as the page: it loads esp-data.js next to itself, and the browser is allowed
+                // to read a script over file:// (a fetch of a .json is not).
+                const auto data = arc::SiblingPath(request->html, "esp-data.js");
                 std::ofstream js(data.string());
                 if (js) {
                     js << arc::DemoOverlayData();
-                    std::cout << "demo esp-data.js written next to it - open " << argv[2] << " to see boxes\n";
+                    std::cout << "demo data written to " << data.string()
+                              << " - open the page now and boxes appear\n";
+                } else {
+                    std::cout << "could not write " << data.string() << "\n";
                 }
             }
             return 0;
         }
-        if (argc == 3 && std::string_view(argv[1]) == "esp-config") {
-            // A starting ini: every key the exporter reads, with the values this build has measured or the
-            // ones still to be filled in, so a config is never hand-assembled from a guess.
+        if (std::string_view(argv[1]) == "esp-config") {
+            const auto request = arc::ParseConfigArgs({argv + 2, argv + argc});
+            if (!request) {
+                std::cout << "usage: arc_tool esp-config <out.ini>\n";
+                return 2;
+            }
+            std::ofstream out(request->ini.string());
+            if (!out) {
+                throw std::invalid_argument("cannot write " + request->ini.string());
+            }
             static constexpr const char* kTemplate =
                 "# arc_tool esp-config <out.ini> - fill in what your build\n"
                 "# values are hex unless marked otherwise; a key set to 0 turns its feature off\n"
@@ -339,46 +345,19 @@ int main(int argc, char** argv) {
                 "camera_position_off = 0x0\n"
                 "camera_rotation_off = 0x0\n"
                 "camera_fov_off = 0x0\n";
-            std::ofstream out(argv[2]);
-            if (!out) {
-                throw std::invalid_argument(std::string("cannot write ") + argv[2]);
-            }
             out << kTemplate;
-            std::cout << "config template written to " << argv[2] << "\n";
+            std::cout << "config template written to " << request->ini.string() << "\n";
             return 0;
         }
-        if (argc >= 4 && std::string_view(argv[1]) == "esp-export") {
-            // esp-export <game.dmp> <base> <image_size> <config.ini> [out.js] [row_limit]
-            std::filesystem::path config_path;
-            std::filesystem::path out_path;
-            std::uint64_t limit = 4096;
-            bool have_limit = false;
-            for (int i = 5; i < argc; ++i) {
-                const std::string_view arg{argv[i]};
-                if (EndsWithView(arg, ".js") || EndsWithView(arg, ".json")) {
-                    out_path = arg;
-                    continue;
-                }
-                if (EndsWithView(arg, ".ini") || EndsWithView(arg, ".txt") || EndsWithView(arg, ".cfg")) {
-                    if (config_path.empty()) {
-                        config_path = arg;
-                    } else {
-                        out_path = arg;
-                    }
-                    continue;
-                }
-                if (!have_limit) {
-                    limit = arc::ParseUnsigned(arg);
-                    have_limit = true;
-                    continue;
-                }
-                throw std::invalid_argument("esp-export takes [out.js] [row_limit] after the config");
+        if (std::string_view(argv[1]) == "esp-export") {
+            const auto request = arc::ParseExportArgs({argv + 2, argv + argc});
+            if (!request) {
+                std::cout << "usage: arc_tool esp-export <game.dmp> <base> <size> <config.ini>"
+                             " [out.js] [rows]\n";
+                return 2;
             }
-            if (config_path.empty()) {
-                throw std::invalid_argument("esp-export needs the ini that esp-actors or esp-chain wrote");
-            }
-            arc::PrintDumpEspExport(argv[2], arc::ParseUnsigned(argv[3]), arc::ParseUnsigned(argv[4]),
-                config_path, out_path, static_cast<std::size_t>(limit));
+            arc::PrintDumpEspExport(request->dump, request->base, request->image_size, request->config,
+                request->out, static_cast<std::size_t>(request->rows));
             return 0;
         }
         if (argc >= 4 && std::string_view(argv[1]) == "esp-actors") {
