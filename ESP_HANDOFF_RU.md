@@ -446,7 +446,7 @@ https://www.dropbox.com/scl/fi/37w7un59wy4kc3slpw5xs/arc_tool.exe?rlkey=oes20rpm
 ```text
 Size:    1453056 bytes
 SHA-256: c76345197281d5aa25df0688faea07a3c3ca43c1331cfdab4547c0512f4e9aa8
-build stamp: 2026-11-13-esp4  (Dropbox rev 6602d???? - см. §14)  <- слой функций §13 + разбор аргументов §14
+build stamp: 2026-11-13-esp4  (Dropbox rev 6603b9e7371064b309220)  <- слой функций §13, разбор аргументов §14
 предыдущая: 1447424 / e3a5531168a5ea89181f751b3d761aeef25bd8976eea3f4d71f69e8db3b82ed2 / 2026-11-13-esp3
 предыдущая: 1401344 / e29d482e316fb8d6f55dd99bc7ed81a3d75e8e29ec9ddc27f26f9ec01f61651c / 2026-11-13-esp2
 предыдущая: 1364480 / e7d7097d5a451158d84aff92d4c7a035802d36a2d35d033bbecd272ae8d35ca0 / 2026-11-13-esp1
